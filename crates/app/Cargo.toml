@@ -1,0 +1,62 @@
+[package]
+name = "open-ntrip-client"
+description = "Open NTRIP Client - diagnostic client for NTRIP/RTK correction streams"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The library target exists so integration tests (tests/worker_mock.rs) can
+# drive the real worker/logging stack; the bin is a thin shell over it.
+[lib]
+name = "open_ntrip_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "OpenNtripClient"
+path = "src/main.rs"
+
+[dependencies]
+ntrip-core = { path = "../ntrip-core" }
+gnss = { path = "../gnss" }
+geodb = { path = "../geodb" }
+# egui stack pinned in lockstep: eframe/egui/egui_extras 0.35.0 all resolve to
+# egui 0.35.0; egui_plot 0.36.0 is the matching plot release for egui 0.35.
+# glow backend instead of the default wgpu: much smaller portable exe.
+eframe = { version = "0.35.0", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.35.0"
+egui_extras = "0.35.0"
+egui_plot = "0.36.0"
+serialport = "4.9.0"
+toml = "1.1.3"
+serde = { version = "1.0.228", features = ["derive"] }
+# TLS: rustls with the ring provider (aws-lc-rs needs cmake/NASM on Windows;
+# ring builds everywhere this project does). No OpenSSL, no DLLs.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+webpki-roots = "1"
+rustls-pki-types = "1"
+
+[build-dependencies]
+# Embeds assets/icon.ico + VERSIONINFO into the Windows exe. Kept an
+# unconditional build-dep (build.rs guards on CARGO_CFG_TARGET_OS) so the
+# guard is correct under cross-compilation; on non-Windows targets the
+# script is a no-op and the crate compiles to dead weight only at build time.
+winresource = "0.1"
+
+[dev-dependencies]
+# Self-signed certificates for the in-test TLS caster.
+rcgen = { version = "0.13", default-features = false, features = [
+    "crypto",
+    "ring",
+] }

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ntrip-core",
+    "crates/gnss",
+    "crates/geodb",
+    "crates/app",
+    "tools/geodb-gen",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/intnsity/OpenNTRIPClient"
+
+# Size-conscious single-file release binary. Expected ~10-14 MB including the
+# embedded ~4 MB geocoding database; no DLLs (rustls, no OpenSSL).
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

@@ -1,0 +1,30 @@
+# Third-party licenses
+
+Open NTRIP Client is distributed under the GPL-3.0-or-later (see LICENSE).
+The compiled binary embeds the third-party components listed below; their
+license texts and attributions follow, as required by the respective
+licenses. This file is generated from Cargo.lock by cargo-about:
+`cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md`.
+
+## Overview
+
+{{#each overview}}
+- {{{name}}} ({{id}}): used {{count}} time(s)
+{{/each}}
+
+## Licenses
+
+{{#each licenses}}
+### {{{name}}} ({{id}})
+
+Applies to:
+
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} - {{{crate.repository}}}{{/if}}
+{{/each}}
+
+```
+{{{text}}}
+```
+
+{{/each}}

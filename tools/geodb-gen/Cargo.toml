@@ -1,0 +1,11 @@
+[package]
+name = "geodb-gen"
+description = "Dev tool: generate crates/geodb/data/geo.bin from GeoNames + US Census sources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+geodb = { path = "../../crates/geodb" }

@@ -1,0 +1,106 @@
+# Release pipeline: tag vX.Y.Z -> 3-OS release builds -> SHA256SUMS -> DRAFT
+# GitHub release. The draft is deliberate: the Windows exe built here is
+# UNSIGNED. The maintainer downloads it, signs it locally (docs/signing.md;
+# the EV key never enters CI), replaces the asset on the draft, re-runs the
+# checksum for the signed file, and only then publishes.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows-x86_64
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+          - os: macos-latest # arm64 runners since macos-14
+            artifact: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux system deps (serialport, eframe)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+      # rustup honors rust-toolchain.toml; this just triggers the install
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag must match the workspace version
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CRATE_VERSION="$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)"
+          if [ "$TAG_VERSION" != "$CRATE_VERSION" ]; then
+            echo "tag v${TAG_VERSION} does not match Cargo.toml version ${CRATE_VERSION}" >&2
+            exit 1
+          fi
+      # A tag is not exempt from the gates: never release an untested build.
+      - name: Test
+        run: cargo test --workspace
+      - name: Release build
+        run: cargo build -p open-ntrip-client --release
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir dist
+          case "${{ matrix.artifact }}" in
+            windows-x86_64)
+              # Bare exe keeps the portable-folder workflow (and the local
+              # sign-and-replace step) simple, but attribution must travel
+              # with the binary: LICENSE, CREDITS.md (Lefebure credit,
+              # GeoNames CC BY 4.0, font attributions) and
+              # THIRD-PARTY-LICENSES.md (OFL / Ubuntu font / Unicode / BSD /
+              # ISC notices) are published as sibling release assets next to
+              # the exe - the same attribution set the tarballs carry.
+              cp target/release/OpenNtripClient.exe LICENSE CREDITS.md THIRD-PARTY-LICENSES.md dist/
+              ;;
+            *)
+              STAGE="open-ntrip-client-${VERSION}-${{ matrix.artifact }}"
+              mkdir "$STAGE"
+              cp target/release/OpenNtripClient LICENSE README.md CREDITS.md THIRD-PARTY-LICENSES.md "$STAGE/"
+              tar -czf "dist/${STAGE}.tar.gz" "$STAGE"
+              ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: sha256sum * | tee SHA256SUMS
+      - name: Draft GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            **Draft - do not publish until the Windows exe is replaced by the
+            locally signed build and SHA256SUMS is updated for it**
+            (docs/signing.md).

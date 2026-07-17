@@ -1,0 +1,38 @@
+# cargo-about configuration: the third-party license audit behind
+# THIRD-PARTY-LICENSES.md. Regenerate after any dependency change with:
+#
+#   cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
+#
+# The release workflow must ship THIRD-PARTY-LICENSES.md next to the exe:
+# several of these licenses (OFL, Ubuntu font, Unicode, BSD, ISC) require
+# their attribution to accompany distribution of the binary.
+accepted = [
+    # The workspace's own crates (this project's license). Their notice entry
+    # is harmless duplication of the root LICENSE; cargo-about cannot skip
+    # them because they are not marked publish = false.
+    "GPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+
+# Notices exist for what ships: dev- and build-only dependencies stay out.
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+
+# The workspace's own GPL-3.0-or-later crates are covered by LICENSE at the
+# repo root, not by third-party notices.
+[private]
+ignore = true

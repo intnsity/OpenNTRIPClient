@@ -1,0 +1,13 @@
+[package]
+name = "gnss"
+description = "NMEA parsing, GGA fabrication, RTCM3 framing and diagnostic decode, geodesy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No cross-platform dependencies: everything is hand-rolled. Windows local-time
+# uses a hand-declared kernel32 GetLocalTime; unix needs libc for localtime_r.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

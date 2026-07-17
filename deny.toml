@@ -1,0 +1,70 @@
+# cargo-deny configuration. Keeps the dependency graph honest for a
+# GPL-3.0-or-later project shipped as a single binary: every crate must carry
+# a license we can legally combine into that binary, no known-vulnerable or
+# yanked versions, and nothing pulled from anywhere but crates.io.
+#
+# Run locally with `cargo deny check`; CI runs the same on every push.
+
+[graph]
+# Check every target we build for - the Windows/macOS/Linux dependency sets
+# differ, and the license list below is their union.
+all-features = false
+
+[licenses]
+# Permissive licenses (MIT/Apache/BSD/ISC/Zlib/Unicode/etc.) all combine into
+# a GPL-3.0 binary. GPL-3.0-only and GPL-3.0-or-later are our own crates and
+# GPL-3.0-compatible copyleft deps. GPL-2.0-only is deliberately NOT allowed:
+# it is incompatible with GPL-3.0, so any dep offering only that license would
+# (correctly) fail here - the dual-licensed ones resolve via their permissive
+# arm instead.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unlicense",
+    "LGPL-2.1-or-later",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# Workspace crates are not published; still evaluated above (they are GPL-3.0).
+ignore = false
+
+[advisories]
+version = 2
+yanked = "deny"
+# quick-xml DoS advisories (crafted-XML quadratic runtime / unbounded
+# namespace allocation). Not applicable here: quick-xml enters the graph ONLY
+# through wayland-scanner (Linux/Wayland), a compile-time proc-macro that
+# parses the trusted, bundled Wayland-protocol XML definitions - never
+# untrusted runtime input - and it is absent from the Windows binary entirely.
+# It is pinned by the winit/eframe GUI stack and cannot advance without moving
+# that whole stack. Re-audit when the GUI stack is next bumped.
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+[bans]
+# eframe/winit pull several duplicate transitive versions (windows-sys,
+# hashbrown, ...); that is upstream churn, not our decision, so warn not deny.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

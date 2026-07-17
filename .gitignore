@@ -1,0 +1,29 @@
+# Original Lefebure client (proprietary source + binaries) - reference only, NEVER publish
+/source/
+
+# Build output (build locally via CARGO_TARGET_DIR, never on the share)
+/target/
+
+# Machine-local cargo config (CARGO_TARGET_DIR redirection lives here, not in the repo)
+/.cargo/
+
+# Runtime artifacts the app writes next to the exe
+/Logs/
+/NMEA/
+/Captures/
+settings.toml
+
+# Raw geodata downloads (generator inputs; geo.bin output IS committed)
+/tools/geodb-gen/raw/
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local tooling and internal working docs (never in the public repo)
+/.claude/
+/plan.md

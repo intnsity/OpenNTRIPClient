@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux system deps (serialport, eframe)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+      # rustup honors rust-toolchain.toml; this just triggers the install
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Release build
+        run: cargo build --workspace --release
+      # Release artifacts (per-OS binaries + SHA256SUMS) are produced by the
+      # tag-triggered release.yml, not here: CI proves every push builds in
+      # release mode, releases are cut only from tags.
+
+  # Supply-chain gate: licenses (GPL-3.0-compatible only), no known
+  # vulnerabilities or yanked crates, crates.io as the sole source. Config and
+  # justified advisory exceptions live in deny.toml.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # Keeps the committed third-party license audit honest: regenerate it from
+  # Cargo.lock with the committed cargo-about config and fail on any drift,
+  # so a dependency change can never ship without its attribution.
+  license-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # --features cli is required: without it no cargo-about binary is built.
+      # Version-pinned to the release that generated the committed file: a
+      # newer cargo-about can change template output (ordering, overview
+      # counts, whitespace) and turn the drift check below into a spurious
+      # failure with zero dependency changes. Bump the pin and regenerate
+      # THIRD-PARTY-LICENSES.md together, in one commit.
+      - name: Install cargo-about
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: THIRD-PARTY-LICENSES.md is current
+        run: |
+          cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
+          git diff --exit-code THIRD-PARTY-LICENSES.md
