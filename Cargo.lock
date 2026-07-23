@@ -1180,11 +1180,11 @@ dependencies = [
 
 [[package]]
 name = "geodb"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "geodb-gen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "geodb",
 ]
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "gnss"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
 ]
@@ -1901,7 +1901,7 @@ checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "ntrip-core"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "num-conv"
@@ -2233,7 +2233,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "open-ntrip-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "eframe",
  "egui",

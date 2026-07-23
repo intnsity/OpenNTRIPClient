@@ -445,6 +445,12 @@ impl App {
             None => format!("Sourcetable: mount {mount} is not listed by this caster"),
         };
         self.hub.event(line);
+        if record.is_none() {
+            // Second line, not a clause on the first: the consequence is the
+            // actionable part, and a long single line clips exactly there.
+            self.hub
+                .event("GGA requirement unknown; 'when required' sends a position anyway");
+        }
     }
 
     fn update_rate_meter(&mut self) {

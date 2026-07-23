@@ -414,11 +414,114 @@ fn rtcm_frame(msg_type: u16, payload_len: usize) -> Vec<u8> {
     frame
 }
 
+/// The CHC APIS field regression, end to end through the real worker: the
+/// caster answers "ICY 200 OK" plus CRNet-style trailing headers and then
+/// HOLDS the stream until any NMEA GGA arrives (verified live against
+/// apis-usa.chcnav.com; base-SN mounts are also absent from that caster's
+/// sourcetable, so the requirement is always unknown). A when_required
+/// profile with no table row - the shipped default - must send a GGA anyway
+/// and receive corrections. Under the old "assume not required" policy this
+/// test deadlocks into StreamSilence.
+#[test]
+fn apis_style_caster_streams_only_after_gga() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 2048];
+        while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+            match sock.read(&mut buf) {
+                Ok(0) => return received,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(_) => {}
+            }
+        }
+        sock.write_all(b"ICY 200 OK\r\nServer: CRNet 1.0\r\n\r\n")
+            .expect("server write");
+        // The APIS latch: no payload until a GGA sentence shows up.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !received.contains(&b'$') && Instant::now() < deadline {
+            match sock.read(&mut buf) {
+                Ok(0) => return received,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(_) => {}
+            }
+        }
+        if received.contains(&b'$') {
+            sock.write_all(&rtcm_frame(1074, 40)).expect("stream write");
+        }
+        // Hold open briefly so the client's cancel ends the run, not a drop.
+        let hold = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < hold {
+            match sock.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(_) => {}
+            }
+        }
+        received
+    });
+
+    let (hub, rx, logger, dir) = stack("apis");
+    let mut j = job(port, "4862676");
+    j.gga_mode = GgaMode::WhenRequired;
+    j.gga_source = GgaSource::Manual;
+    j.manual_lat = 35.1069;
+    j.manual_lon = -106.2909;
+    j.stream_requires_gga = None; // APIS never lists its base-SN mounts
+
+    let handle = ntrip::spawn(
+        j,
+        hub,
+        Arc::new(CorrQueue::new(256)),
+        Arc::new(RwLock::new(None)),
+    );
+    // Wait for first corrections, then disconnect like a user would.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut events = Vec::new();
+    let mut streamed = false;
+    while !streamed && Instant::now() < deadline {
+        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
+            if matches!(ev, AppEvent::RxBytes { total } if total > 0) {
+                streamed = true;
+            }
+            events.push(ev);
+        }
+    }
+    handle.cancel();
+    let (more, stopped) = collect_until_stopped(&rx, Instant::now() + Duration::from_secs(5));
+    assert!(handle.join(Duration::from_secs(2)));
+    logger.shutdown();
+    events.extend(more);
+    let received = server.join().unwrap();
+
+    assert!(streamed, "no corrections arrived: the GGA latch never opened");
+    let received_text = String::from_utf8_lossy(&received);
+    assert!(
+        received_text.contains("$GPGGA"),
+        "the caster never saw a GGA: {received_text}"
+    );
+    let lines = event_lines(&events);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("will send GGA in case it is required")),
+        "the unknown-requirement send assumption must be logged: {lines:?}"
+    );
+    let (_, failed) = stopped.expect("worker must stop");
+    assert!(!failed, "a user cancel of a healthy stream is not a failure");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Contract bundle for the reconnect supervisor: a drop after healthy data
 /// posts ReconnectWait numbered per-outage (counter reset by data), logs the
 /// 10 s notice, and the wait is cancellable in 100 ms slices - a cancel must
 /// end the worker in far less than the 10 s delay. Also pins the
-/// when_required-with-unknown-table GGA assumption line.
+/// when_required-with-unknown-requirement assumption line (GGA is SENT on
+/// unknown requirements since the APIS fix).
 #[test]
 fn drop_with_auto_reconnect_waits_and_cancel_cuts_the_wait_short() {
     let mut resp = b"ICY 200 OK\r\n".to_vec();
@@ -483,8 +586,8 @@ fn drop_with_auto_reconnect_waits_and_cancel_cuts_the_wait_short() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("assuming the stream does not require GGA")),
-        "when_required with no cached table row must log its assumption: {lines:?}"
+            .any(|l| l.contains("will send GGA in case it is required")),
+        "when_required with no cached table row must log its send assumption: {lines:?}"
     );
     let (summary, failed) = stopped.expect("worker must stop");
     assert_eq!(summary, "Disconnected by user");

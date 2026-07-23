@@ -6273,11 +6273,11 @@ insights.
 
 Applies to:
 
-- open-ntrip-client 0.2.0 - https://github.com/intnsity/OpenNTRIPClient
-- geodb 0.2.0 - https://github.com/intnsity/OpenNTRIPClient
-- gnss 0.2.0 - https://github.com/intnsity/OpenNTRIPClient
-- ntrip-core 0.2.0 - https://github.com/intnsity/OpenNTRIPClient
-- geodb-gen 0.2.0 - https://github.com/intnsity/OpenNTRIPClient
+- open-ntrip-client 0.2.1 - https://github.com/intnsity/OpenNTRIPClient
+- geodb 0.2.1 - https://github.com/intnsity/OpenNTRIPClient
+- gnss 0.2.1 - https://github.com/intnsity/OpenNTRIPClient
+- ntrip-core 0.2.1 - https://github.com/intnsity/OpenNTRIPClient
+- geodb-gen 0.2.1 - https://github.com/intnsity/OpenNTRIPClient
 
 ```
 GNU GENERAL PUBLIC LICENSE

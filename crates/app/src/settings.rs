@@ -418,16 +418,21 @@ impl Default for Profile {
             username: String::new(),
             password: String::new(),
             mountpoint: String::new(),
-            // Parity-shaped defaults, kept deliberately after the E2E audit:
-            // the original passed the receiver's GGA through whenever the
-            // stream's nmea flag demanded a position. The known trap - with
-            // no cached sourcetable, when_required silently resolves to
-            // "send nothing", and Receiver source sends nothing without GPS
-            // hardware - is handled by making the downgrade LOUD (the worker
-            // logs the GGA plan at streaming start, warns at connect time,
-            // and hints at close time), not by changing the defaults:
-            // "always" would fabricate a 0,0 position for manual-source
-            // profiles, which is worse than sending nothing.
+            // Defaults revisited after the CHC APIS field failure (0.2.1):
+            // APIS casters answer "ICY 200 OK" and then hold the stream
+            // until ANY GGA arrives, and their base-SN mounts are absent
+            // from their own sourcetable - so when_required's old
+            // unknown-requirement fallback of "send nothing" deadlocked the
+            // default profile forever ("waiting for data" plus a silence
+            // timeout on loop). when_required now assumes "required" when
+            // the table cannot answer; only an explicit nmea=0 row
+            // suppresses sending. The fabricate-at-0,0 hazard that once
+            // justified the silent fallback is closed at the send site
+            // instead: an unset manual position (exactly 0,0) sends nothing
+            // and says so, rather than inventing a confident fix on Null
+            // Island for a VRS to chew on. Receiver source stays the
+            // default: field rovers have GPS hardware attached, and its
+            // misses are explained in the event log.
             gga_mode: GgaMode::WhenRequired,
             gga_source: GgaSource::Receiver,
             manual_lat: 0.0,
@@ -916,10 +921,11 @@ size = [10.0, 9999.0]
     }
 
     /// The defaults a fresh profile ships with, pinned as a deliberate
-    /// decision (see Profile::default's comment): GGA stays parity-shaped
-    /// and outage-riding reconnect stays on. If this test fails, someone
-    /// changed field behavior for every new user - re-read the E2E audit
-    /// before accepting that.
+    /// decision (see Profile::default's comment): when_required GGA (which
+    /// sends on unknown requirements - the APIS fix), receiver source, and
+    /// outage-riding reconnect on. If this test fails, someone changed
+    /// field behavior for every new user - re-read the APIS root-cause
+    /// notes before accepting that.
     #[test]
     fn new_profile_and_reconnect_defaults_are_deliberate() {
         let p = Profile::default();

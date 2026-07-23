@@ -123,14 +123,15 @@ fn body(app: &mut App, ui: &mut egui::Ui) {
         });
 
     // The "when required" caveat only earns its ink while that mode is
-    // selected: it explains exactly that option (and its dependence on a
-    // downloaded sourcetable), so it is noise next to "off" or "always".
+    // selected: it explains exactly that option, so it is noise next to
+    // "off" or "always".
     if p.gga_mode == GgaMode::WhenRequired {
         ui.label(
             egui::RichText::new(
-                "when required = only for streams whose sourcetable entry sets \
-                 the NMEA flag. With no sourcetable downloaded this sends \
-                 nothing - use Get Sourcetable first.",
+                "when required = send unless the sourcetable's entry says the \
+                 mount takes no NMEA. Mounts the caster does not list get a \
+                 position too - some casters (CHC APIS) need one before they \
+                 will stream.",
             )
             .small()
             .weak(),
@@ -291,7 +292,10 @@ fn step_selection(selected: usize, len: usize, down: bool) -> usize {
 
 /// One-line collapsed summary of the profile's GGA configuration, so the
 /// disclosure communicates its state without being opened. "off" says it all
-/// on its own - source and position are moot when nothing is sent.
+/// on its own - source and position are moot when nothing is sent. An unset
+/// manual position must not masquerade as a survey mark at 0.00000, 0.00000:
+/// the worker refuses to fabricate from it, and the front page has to agree
+/// with the event log about that.
 fn summary(mode: GgaMode, source: GgaSource, lat: f64, lon: f64) -> String {
     let mode_txt = match mode {
         GgaMode::Off => return "off".to_string(),
@@ -300,7 +304,10 @@ fn summary(mode: GgaMode, source: GgaSource, lat: f64, lon: f64) -> String {
     };
     let src = match source {
         GgaSource::Receiver => "receiver".to_string(),
-        GgaSource::Manual => format!("manual {lat:.5}, {lon:.5}"),
+        GgaSource::Manual if crate::workers::ntrip::manual_position_set(lat, lon) => {
+            format!("manual {lat:.5}, {lon:.5}")
+        }
+        GgaSource::Manual => "manual - position NOT SET".to_string(),
     };
     format!("{mode_txt}, {src}")
 }
@@ -381,6 +388,12 @@ mod tests {
         assert_eq!(
             summary(GgaMode::Always, GgaSource::Manual, 45.52021, -122.67419),
             "always, manual 45.52021, -122.67419"
+        );
+        // The unset (0, 0) default must not read as a real coordinate: the
+        // worker will send nothing, and the summary has to say so.
+        assert_eq!(
+            summary(GgaMode::WhenRequired, GgaSource::Manual, 0.0, 0.0),
+            "when required, manual - position NOT SET"
         );
     }
 

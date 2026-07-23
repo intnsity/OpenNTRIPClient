@@ -766,6 +766,37 @@ fn gga_cadence_first_at_300ms_then_10s_after_sent() {
     assert_eq!(gga_dues(&out), 2);
 }
 
+/// A miss (the caller had no position for a due GGA) re-arms on the short
+/// 2 s retry slot, not the full 10 s interval: against a caster that holds
+/// the stream until a position arrives (CHC APIS), the first available fix
+/// must reach the wire promptly - a 10 s miss cadence can lose the race
+/// against the 30 s silence timeout when the receiver fixes late.
+#[test]
+fn gga_missed_retries_on_the_short_slot() {
+    let t0 = Instant::now();
+    let (mut s, _) = NtripSession::new(gga_cfg(GgaPolicy::Always), t0);
+    let mut out = Vec::new();
+    let t1 = t0 + ms(100);
+    s.on_bytes(b"ICY 200 OK\r\n\xD3", t1, &mut out);
+    s.on_tick(t1 + ms(300), &mut out);
+    assert_eq!(gga_dues(&out), 1);
+
+    let t_miss = t1 + ms(400);
+    s.gga_missed(t_miss);
+    s.on_tick(t_miss + ms(1_900), &mut out);
+    assert_eq!(gga_dues(&out), 1, "not due before the 2 s retry slot");
+    s.on_tick(t_miss + ms(2_000), &mut out);
+    assert_eq!(gga_dues(&out), 2);
+
+    // A successful send restores the full 10 s cadence.
+    let t_sent = t_miss + ms(2_100);
+    s.gga_sent(t_sent);
+    s.on_tick(t_sent + ms(9_900), &mut out);
+    assert_eq!(gga_dues(&out), 2);
+    s.on_tick(t_sent + ms(10_000), &mut out);
+    assert_eq!(gga_dues(&out), 3);
+}
+
 #[test]
 fn gga_policy_gating() {
     let t0 = Instant::now();

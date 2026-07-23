@@ -87,9 +87,10 @@ of its current setting - is where you configure that. Click the header to expand
 
 1. **Send GGA** - the mode:
    - `off` - never send a position.
-   - `when required` - send only for mounts whose sourcetable entry sets the NMEA flag.
-     (This needs a downloaded sourcetable; with none, it sends nothing - use **Get
-     Sourcetable** first.)
+   - `when required` (the default) - send unless the sourcetable's entry for the mount says
+     it takes no NMEA. Mounts the caster does not list - CHC APIS base serial numbers, for
+     example - get a position too: APIS-style casters accept the connection and then hold
+     the stream until a GGA arrives, so withholding one reads as a dead mount.
    - `always` - send regardless.
 2. **Position source** - `receiver` passes your connected receiver's live GGA through
    verbatim; `manual` fabricates a GGA at the position you enter below.
@@ -101,7 +102,10 @@ of its current setting - is where you configure that. Click the header to expand
 5. **Use receiver position** - copy the connected receiver's current position into the manual
    fields.
 
-The GGA sentence is sent about 0.3 s after connect, then every 10 s.
+The GGA sentence is sent about 0.3 s after connect, then every 10 s. If there is nothing to
+send yet (receiver source with no fix, or a manual position still at its unset 0, 0 default),
+the client retries every 2 s and explains the miss in the event log; the first position to
+appear goes out promptly.
 
 ### 5. Live readouts and the activity bar
 

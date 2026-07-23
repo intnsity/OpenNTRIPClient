@@ -1,6 +1,6 @@
 //! Headless verification mode: `OpenNtripClient --selftest --host H --port P
 //! [--mount M] [--user U] [--pass W] [--v2] [--tcp] [--tls] [--insecure-tls]
-//! [--capture FILE] [--seconds N]`.
+//! [--gga LAT,LON] [--capture FILE] [--seconds N]`.
 //!
 //! Runs the REAL ntrip worker and logger stack - the same code the GUI
 //! drives - with no GUI and no serial port, printing every event line to
@@ -36,7 +36,7 @@ use crate::{paths, user_agent};
 
 const USAGE: &str = "usage: OpenNtripClient --selftest --host H --port P \
 [--mount M] [--user U] [--pass W] [--v2] [--tcp] [--tls] [--insecure-tls] \
-[--capture FILE] [--seconds N]";
+[--gga LAT,LON] [--capture FILE] [--seconds N]";
 
 /// Ceiling for `--seconds`: one day. See the parse-time check for why.
 const MAX_SECONDS: u64 = 86_400;
@@ -52,9 +52,31 @@ struct Args {
     tls: bool,
     /// Accept any certificate (implies --tls).
     insecure_tls: bool,
+    /// Send a manual-position GGA (Always mode): needed to verify casters
+    /// that hold the stream until a position arrives (CHC APIS).
+    gga: Option<(f64, f64)>,
     /// Write raw correction bytes to this file.
     capture: Option<String>,
     seconds: u64,
+}
+
+/// "LAT,LON" in decimal degrees. (0, 0) exactly is rejected: the worker
+/// treats it as "position never configured" and would send nothing, which
+/// silently defeats the flag's purpose.
+fn parse_gga(value: &str) -> Result<(f64, f64), String> {
+    let err = || format!("invalid --gga (want LAT,LON in decimal degrees): {value}");
+    let (lat, lon) = value.split_once(',').ok_or_else(err)?;
+    let lat: f64 = lat.trim().parse().map_err(|_| err())?;
+    let lon: f64 = lon.trim().parse().map_err(|_| err())?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return Err(err());
+    }
+    if lat == 0.0 && lon == 0.0 {
+        return Err("--gga 0,0 means 'position unset' and sends nothing; \
+                    give a real position"
+            .to_string());
+    }
+    Ok((lat, lon))
 }
 
 fn next_value<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> Result<String, String> {
@@ -74,6 +96,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         tcp: false,
         tls: false,
         insecure_tls: false,
+        gga: None,
         capture: None,
         seconds: 10,
     };
@@ -93,6 +116,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--tcp" => out.tcp = true,
             "--tls" => out.tls = true,
             "--insecure-tls" => out.insecure_tls = true,
+            "--gga" => out.gga = Some(parse_gga(&next_value(&mut it, "--gga")?)?),
             "--capture" => out.capture = Some(next_value(&mut it, "--capture")?),
             "--seconds" => {
                 let v = next_value(&mut it, "--seconds")?;
@@ -113,16 +137,23 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     if out.port == 0 {
         return Err("--port is required".to_string());
     }
+    if out.tcp && out.gga.is_some() {
+        // Raw TCP has no NTRIP handshake and the session never asks for GGA;
+        // silently accepting the combination would "certify" a caster while
+        // sending nothing.
+        return Err("--gga has no effect with --tcp".to_string());
+    }
     Ok(out)
 }
 
 /// Console line for one bus event, or None for events the selftest does not
-/// print. Deliberately ignores `ConnLine`: in M2 the worker mirrors every
+/// print. Deliberately ignores `ConnLine`: the worker mirrors every
 /// connection-log line it can emit under a selftest config (protocol TX/RX,
-/// reconnect notices) into the event sink too - there is no Connection Log
-/// window yet - so printing both sinks echoed every protocol line twice.
-/// The only conn-exclusive line, a GGA send, cannot occur here: the selftest
-/// runs with GGA off.
+/// reconnect notices) into the event sink too, so printing both sinks
+/// echoed every protocol line twice. The one conn-exclusive line, a GGA
+/// send under --gga, stays unprinted; the "Receiving data (...; sending GGA
+/// every 10 s ...)" plan line plus the delivered byte count already certify
+/// the GGA path.
 fn console_line(ev: &AppEvent) -> Option<String> {
     match ev {
         AppEvent::EventLine(line) => Some(line.clone()),
@@ -247,10 +278,17 @@ pub fn run(args: &[String]) -> u8 {
         },
         tls: args.tls || args.insecure_tls,
         allow_invalid_certs: args.insecure_tls,
-        gga_mode: GgaMode::Off,
+        // --gga forces Always+Manual: the point of the flag is to certify
+        // casters that hold the stream until a position arrives (CHC APIS),
+        // so the send must not depend on any sourcetable lookup.
+        gga_mode: if args.gga.is_some() {
+            GgaMode::Always
+        } else {
+            GgaMode::Off
+        },
         gga_source: GgaSource::Manual,
-        manual_lat: 0.0,
-        manual_lon: 0.0,
+        manual_lat: args.gga.map_or(0.0, |(lat, _)| lat),
+        manual_lon: args.gga.map_or(0.0, |(_, lon)| lon),
         stream_requires_gga: None,
         // One shot: a selftest that retried for minutes would be useless.
         reconnect: ntrip::ReconnectPolicy::OneShot,
@@ -615,6 +653,133 @@ ENDSOURCETABLE\r\n",
         assert!(!a.insecure_tls);
         assert_eq!(a.capture.as_deref(), Some("out.rtcm"));
         assert_eq!(a.seconds, 3);
+    }
+
+    /// --gga parses decimal-degree pairs, rejects malformed and
+    /// out-of-range values, and rejects exactly 0,0 (the worker's "unset"
+    /// sentinel - accepting it would silently send nothing).
+    #[test]
+    fn gga_flag_parses_and_rejects_unset_sentinel() {
+        let a = parse_args(&s(&[
+            "--selftest",
+            "--host",
+            "h",
+            "--port",
+            "2201",
+            "--gga",
+            "35.1069,-106.2909",
+        ]))
+        .unwrap();
+        assert_eq!(a.gga, Some((35.1069, -106.2909)));
+        assert!(parse_gga("35.1, -106.3").is_ok(), "spaces after the comma");
+        assert!(parse_gga("0,0").is_err(), "0,0 means unset");
+        assert!(parse_gga("91,0").is_err(), "latitude range");
+        assert!(parse_gga("0,181").is_err(), "longitude range");
+        assert!(parse_gga("nope").is_err());
+        assert!(parse_gga("1;2").is_err());
+        assert_eq!(
+            run(&s(&["--selftest", "--host", "h", "--port", "1", "--gga", "0,0"])),
+            2,
+            "0,0 must be a usage error, not a silent no-op run"
+        );
+        // Raw TCP never sends GGA; the combination must refuse loudly
+        // rather than certify a caster while sending nothing.
+        assert_eq!(
+            run(&s(&[
+                "--selftest",
+                "--host",
+                "h",
+                "--port",
+                "1",
+                "--tcp",
+                "--gga",
+                "35,-106",
+            ])),
+            2,
+            "--gga with --tcp is a usage error"
+        );
+    }
+
+    /// The CHC APIS shape at the exit-code level: a caster that answers ICY
+    /// and holds the stream until a GGA arrives must FAIL without --gga
+    /// (zero correction bytes) and PASS with it. This is the headless
+    /// verification path for the field failure that motivated 0.2.1.
+    #[test]
+    fn apis_style_latch_passes_only_with_gga_flag() {
+        use std::io::{Read, Write};
+
+        let serve_apis = || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handle = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                sock.set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let mut received = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf) {
+                        Ok(0) => return,
+                        Ok(n) => received.extend_from_slice(&buf[..n]),
+                        Err(_) => {}
+                    }
+                }
+                let _ = sock.write_all(b"ICY 200 OK\r\nServer: CRNet 1.0\r\n\r\n");
+                let deadline = Instant::now() + Duration::from_secs(6);
+                while !received.contains(&b'$') && Instant::now() < deadline {
+                    match sock.read(&mut buf) {
+                        Ok(0) => return,
+                        Ok(n) => received.extend_from_slice(&buf[..n]),
+                        Err(_) => {}
+                    }
+                }
+                if received.contains(&b'$') {
+                    let _ = sock.write_all(&[0xD3, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                }
+                // Hold until the client hangs up.
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) if Instant::now() > deadline + Duration::from_secs(6) => break,
+                        Err(_) => {}
+                    }
+                }
+            });
+            (port, handle)
+        };
+
+        let (port, server) = serve_apis();
+        let code = run(&s(&[
+            "--selftest",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--mount",
+            "4862676",
+            "--gga",
+            "35.1069,-106.2909",
+            "--seconds",
+            "5",
+        ]));
+        assert_eq!(code, 0, "with --gga the latch must open and bytes flow");
+        server.join().unwrap();
+
+        let (port, server) = serve_apis();
+        let code = run(&s(&[
+            "--selftest",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--mount",
+            "4862676",
+            "--seconds",
+            "2",
+        ]));
+        assert_eq!(code, 1, "without a GGA the mount delivers nothing");
+        server.join().unwrap();
     }
 
     #[test]

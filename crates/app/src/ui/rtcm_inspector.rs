@@ -310,10 +310,10 @@ fn position_text(lla: Option<(f64, f64, f64)>) -> String {
 /// The user-side end of the baseline as (lat, lon, height): the receiver's
 /// last known GGA position when one exists, else the profile's manual point
 /// at height 0 (the manual location has no altitude field, and a truncated
-/// vertical is still far closer than no vertical at all). A manual (0, 0)
-/// is the untouched profile default, not a survey mark on Null Island, so
-/// exact zeros count as "no position" rather than yielding a nonsense
-/// baseline.
+/// vertical is still far closer than no vertical at all). "Is the manual
+/// point real" is the worker's `manual_position_set` judgement - one source
+/// of truth for the (0, 0)-means-unset sentinel and the garbage-coordinate
+/// guard, here as at the GGA send site.
 fn user_position(
     receiver: Option<(f64, f64, f64)>,
     manual_lat: f64,
@@ -322,7 +322,7 @@ fn user_position(
     if let Some(p) = receiver {
         return Some((p, "receiver"));
     }
-    if manual_lat == 0.0 && manual_lon == 0.0 {
+    if !crate::workers::ntrip::manual_position_set(manual_lat, manual_lon) {
         return None;
     }
     Some(((manual_lat, manual_lon, 0.0), "manual"))

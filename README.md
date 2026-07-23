@@ -10,7 +10,7 @@ It is a clean-room successor to the
 caster is up, credentials work, a mountpoint streams, and geofencing accepts your position),
 rebuilt in Rust with the whole protocol conversation on one screen. No code was reused.
 
-**Status: 0.2.0, pre-release (pre-1.0).**
+**Status: 0.2.1, pre-release (pre-1.0).**
 
 ## Features
 

@@ -74,6 +74,23 @@ XOR checksum. Sent ~0.3 s after connect, then every 10 s, only when the stream's
 flag requires it. Ours keeps the exact template and cadence, adds an "always send"
 override, and keeps manual entry alongside the new city/ZIP lookup.
 
+Deliberate deviations (0.2.1, the CHC APIS root cause):
+
+- An UNKNOWN requirement - no sourcetable, or the mount not listed in it - counts as
+  "required". CHC APIS casters (`Server: CRNet 1.0`, apis-usa.chcnav.com:2201) answer
+  `ICY 200 OK` to a base-SN mountpoint request and then send zero payload until any
+  syntactically valid GGA arrives (verified live: the stream opens ~0.7 s after the first
+  GGA, at any position whatsoever - even the wrong continent). Their sourcetable is a stub
+  that never lists base-SN mounts, so "only when the table requires it" deadlocked into
+  the 30 s silence timeout forever. Casters that do not want a GGA ignore it; the harm is
+  asymmetric. An explicit nmea=0 row still suppresses sending.
+- A due GGA with nothing to send (no receiver fix yet, manual position unset) retries on a
+  2 s slot instead of the 10 s cadence, so the first fix cannot lose a race against the
+  30 s silence timeout.
+- A manual position of exactly (0, 0) is treated as "not configured" and never fabricated
+  into a sentence: a confident quality-4 fix on Null Island can bind a VRS to a nonsense
+  reference position, which is worse than sending nothing and saying so in the log.
+
 ### Serial side
 
 Corrections are forwarded verbatim to the receiver COM port (no parsing of RTCM). The same

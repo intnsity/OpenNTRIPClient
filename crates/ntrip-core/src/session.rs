@@ -14,7 +14,8 @@
 //!   snapshot point, and the close itself still fires either way.
 //! - Close is emitted exactly once, ever, and the session is Done (inert)
 //!   afterwards. All closes funnel through `emit_close`.
-//! - GgaDue is never emitted twice without an intervening `gga_sent`.
+//! - GgaDue is never emitted twice without an intervening `gga_sent` or
+//!   `gga_missed`.
 //! - The caller owns socket and clock; it promises monotonic `now` values
 //!   and ticks at most 500 ms apart, which bounds how late a deadline fires.
 
@@ -32,6 +33,12 @@ const TABLE_TIMEOUT: Duration = Duration::from_secs(10);
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const GGA_FIRST_DELAY: Duration = Duration::from_millis(300);
 const GGA_INTERVAL: Duration = Duration::from_secs(10);
+/// Retry slot after a miss (the caller had no position to send). Casters
+/// that hold the stream until a position arrives (CHC APIS) make every
+/// missed slot dead air, and a full 10 s cadence can lose the race against
+/// the 30 s silence timeout when the receiver's first fix lands late; a
+/// short retry keeps first-fix-to-first-correction latency small.
+const GGA_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 pub struct NtripSession {
     /// True when the request named a mountpoint. Drives the
@@ -127,7 +134,8 @@ enum Gga {
     /// Enabled but not streaming yet.
     Idle,
     Due(Instant),
-    /// GgaDue emitted; waiting for the caller's gga_sent.
+    /// GgaDue emitted; waiting for the caller's gga_sent (position written)
+    /// or gga_missed (nothing to write, or the write failed).
     AwaitSent,
 }
 
@@ -266,6 +274,15 @@ impl NtripSession {
     pub fn gga_sent(&mut self, now: Instant) {
         if !matches!(self.gga, Gga::Disabled) {
             self.gga = Gga::Due(now + GGA_INTERVAL);
+        }
+    }
+
+    /// The caller had nothing to send for a due GGA (no receiver fix yet, no
+    /// manual position configured); retry on the short slot instead of the
+    /// full interval.
+    pub fn gga_missed(&mut self, now: Instant) {
+        if !matches!(self.gga, Gga::Disabled) {
+            self.gga = Gga::Due(now + GGA_RETRY_DELAY);
         }
     }
 

@@ -102,16 +102,35 @@ impl ReconnectPolicy {
 }
 
 /// Map profile GGA settings onto the session's policy. `when_required` with
-/// an unknown sourcetable defaults to NOT sending - the caller logs that
-/// assumption so support staff can see why no GGA went out.
+/// an unknown requirement - no sourcetable cached, or the mount not listed
+/// in it, the norm for dynamically provisioned mounts like CHC APIS base
+/// serial numbers - defaults to SENDING; only an explicit nmea=0 row
+/// suppresses it. The harm is asymmetric: casters ignore a GGA they did not
+/// ask for, while APIS-style casters answer "ICY 200 OK" and then hold the
+/// stream until a position arrives, which reads as a dead mount. The caller
+/// logs the assumption so support staff can see why GGA went out.
 pub fn gga_policy(mode: GgaMode, stream_requires: Option<bool>) -> GgaPolicy {
     match mode {
         GgaMode::Off => GgaPolicy::Off,
         GgaMode::Always => GgaPolicy::Always,
         GgaMode::WhenRequired => GgaPolicy::WhenRequired {
-            stream_requires: stream_requires.unwrap_or(false),
+            stream_requires: stream_requires.unwrap_or(true),
         },
     }
+}
+
+/// A manual position of exactly (0, 0) is "never configured", not a real
+/// point in the Gulf of Guinea: fabricating a confident quality-4 fix there
+/// could bind a VRS to a nonsense reference position, which is strictly
+/// worse than sending nothing and saying so. Non-finite or out-of-range
+/// coordinates count as unset too - settings.toml is hand-editable and TOML
+/// happily parses `nan`/`inf`, which fabricate() would render as garbage
+/// digits under a valid checksum. This guard is what makes the
+/// send-by-default `when_required` policy safe for manual-source profiles.
+pub fn manual_position_set(lat: f64, lon: f64) -> bool {
+    (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lon)
+        && (lat != 0.0 || lon != 0.0)
 }
 
 /// The reconnect gate: transient reason, user opted in, attempt budget left.
@@ -247,19 +266,21 @@ pub fn close_event_line(
 }
 
 /// One clause describing what this connection will do about GGA, appended to
-/// "Receiving data" so a silently-off GGA plan (when_required with no cached
-/// sourcetable collapses to "send nothing") is visible the moment streaming
-/// starts instead of only when a caster kicks the position-silent client.
-/// `receiver_gga_ready` is whether a receiver GGA is available RIGHT NOW:
-/// the receiver arm must read as intent, not fact, while no fix exists -
-/// otherwise the plan claims GGA is flowing seconds before the "No receiver
-/// GGA available" miss contradicts it in the same log.
+/// "Receiving data" so a plan that sends nothing (mode off, an nmea=0 row,
+/// or an enabled mode with no position to send) is visible the moment
+/// streaming starts instead of only when a caster kicks the position-silent
+/// client. `receiver_gga_ready` is whether a receiver GGA is available RIGHT
+/// NOW and `manual_set` whether the profile holds a real manual position:
+/// both position arms must read as intent, not fact, while nothing exists to
+/// send - otherwise the plan claims GGA is flowing seconds before a "not
+/// sent" miss contradicts it in the same log.
 pub fn gga_plan(
     transport: Transport,
     mode: GgaMode,
     stream_requires: Option<bool>,
     source: GgaSource,
     receiver_gga_ready: bool,
+    manual_set: bool,
 ) -> &'static str {
     if matches!(transport, Transport::RawTcp) {
         return "GGA not applicable (raw TCP)";
@@ -271,7 +292,10 @@ pub fn gga_plan(
     };
     match (enabled, source) {
         (false, _) => "GGA off",
-        (true, GgaSource::Manual) => "sending GGA every 10 s (manual position)",
+        (true, GgaSource::Manual) if manual_set => "sending GGA every 10 s (manual position)",
+        (true, GgaSource::Manual) => {
+            "GGA wanted but the manual position is not set - edit the profile"
+        }
         (true, GgaSource::Receiver) if receiver_gga_ready => {
             "sending GGA every 10 s (receiver passthrough)"
         }
@@ -317,12 +341,12 @@ pub fn gga_hint(
             "This mount requests NMEA GGA (sourcetable nmea=1) and none was sent".to_string(),
             "Enable Send GGA in the profile and check the position source".to_string(),
         ]),
-        // Requirement unknown (no cached sourcetable): worth one pointer,
-        // but only on a fast death.
+        // Requirement unknown (no cached sourcetable row): with the
+        // send-by-default policy, zero GGA sent means the mode was off or no
+        // position was available to send - point at both, on a fast death.
         None if died_fast => Some([
             "If this mount requires NMEA GGA, casters drop silent clients".to_string(),
-            "Fetch the sourcetable to check, or set Send GGA to 'always' in the profile"
-                .to_string(),
+            "Check Send GGA is on and a position source exists (receiver or manual)".to_string(),
         ]),
         // The cached table says no GGA is needed - but tables go stale, and
         // an operator enabling the requirement later reproduces exactly this
@@ -801,14 +825,12 @@ fn drive_connection(cx: &mut Cx, sock: TcpStream) -> SessionEnd {
         && !cx.gga_assumption_logged
     {
         cx.gga_assumption_logged = true;
-        // Two short lines, diagnosis then remedy: one long sentence clips at
-        // the default window width and hides the remedy.
+        // "will send", not "sending": with no position source available yet
+        // this is intent, and the miss notes explain any gap.
         cx.hub.event(format!(
-            "No cached sourcetable entry for '{}'; assuming the stream does not require GGA",
+            "No sourcetable entry for '{}'; will send GGA in case it is required",
             cx.job.mountpoint
         ));
-        cx.hub
-            .event("Use Get Sourcetable to check, or set Send GGA to 'always' in the profile");
     }
     // The one configuration certain to be kicked by a GGA-requiring caster:
     // the sourcetable says nmea=1 but the profile will never send a position.
@@ -873,7 +895,7 @@ fn drive_connection(cx: &mut Cx, sock: TcpStream) -> SessionEnd {
         connected_at: Instant::now(),
         bytes_at_connect: cx.total_bytes,
         gga_sent: 0,
-        gga_unavailable_logged: false,
+        last_miss_note: None,
         terminal: None,
     };
     let mut buf = [0u8; 8192];
@@ -937,10 +959,50 @@ struct ConnState {
     /// GGA sentences actually written to the wire on this connection; zero
     /// at close time is what triggers the GGA-starvation hint.
     gga_sent: u32,
-    /// First "no receiver GGA" miss gets the long explanation; the 10 s
-    /// repeats stay short so they do not drown the log.
-    gga_unavailable_logged: bool,
+    /// When the last due-GGA miss was logged, None before the first. Misses
+    /// retry every 2 s, far too often to log each one; see note_gga_miss.
+    last_miss_note: Option<Instant>,
     terminal: Option<SessionEnd>,
+}
+
+/// Cadence for repeated miss lines while the stream is still silent.
+const MISS_NOTE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Miss texts as [diagnosis, remedy]; each line must fit the default-width
+/// event log (<= 80 chars, pinned by test) - the remedy is exactly the part
+/// clipping would hide.
+const MISS_NO_RECEIVER: [&str; 2] = [
+    "No receiver GGA available; position not sent (no GPS receiver is connected)",
+    "Connect one on the Serial side, or switch the position source to manual",
+];
+const MISS_NO_MANUAL: [&str; 2] = [
+    "No manual position set; GGA not sent (the profile has no usable coordinates)",
+    "Set the manual position in the profile, or switch the source to receiver",
+];
+const MISS_REPEAT: &str = "Still no position to send; the caster may be waiting for a GGA";
+
+/// Log a due-GGA miss without flooding the event log: the first miss per
+/// connection gets diagnosis + remedy as two short lines, later misses
+/// repeat one line every 10 s while the stream is still silent (the state
+/// where the missing position is the probable cause, exactly the APIS
+/// deadlock), and go quiet once corrections flow - a healthy stream does
+/// not need a nag every retry slot.
+fn note_gga_miss(cx: &mut Cx, conn: &mut ConnState, texts: &[&str; 2]) {
+    let now = Instant::now();
+    match conn.last_miss_note {
+        None => {
+            cx.hub.event(texts[0]);
+            cx.hub.event(texts[1]);
+            conn.last_miss_note = Some(now);
+        }
+        Some(prev)
+            if !conn.streaming && now.duration_since(prev) >= MISS_NOTE_INTERVAL =>
+        {
+            cx.hub.event(MISS_REPEAT);
+            conn.last_miss_note = Some(now);
+        }
+        Some(_) => {}
+    }
 }
 
 fn dispatch(
@@ -1035,6 +1097,7 @@ fn on_corrections(cx: &mut Cx, conn: &mut ConnState, bytes: &[u8]) {
                 cx.job.stream_requires_gga,
                 cx.job.gga_source,
                 receiver_gga_ready,
+                manual_position_set(cx.job.manual_lat, cx.job.manual_lon),
             ),
         ));
         cx.hub.status(AppEvent::Ntrip(NtripStatus::Streaming));
@@ -1107,38 +1170,33 @@ fn deframe(conn: &mut ConnState, bytes: &[u8], batch: &mut RtcmBatch) {
 
 fn on_gga_due(cx: &mut Cx, session: &mut NtripSession, io: &mut Conn, conn: &mut ConnState) {
     let sentence = match cx.job.gga_source {
-        GgaSource::Manual => gnss::gga::fabricate(
-            cx.job.manual_lat,
-            cx.job.manual_lon,
-            &gnss::clock::now_utc(),
-        ),
+        GgaSource::Manual => {
+            if !manual_position_set(cx.job.manual_lat, cx.job.manual_lon) {
+                note_gga_miss(cx, conn, &MISS_NO_MANUAL);
+                // Retry on the short slot: the user may set a position while
+                // the connection waits, and GgaDue never repeats without a
+                // re-arm.
+                session.gga_missed(Instant::now());
+                return;
+            }
+            gnss::gga::fabricate(
+                cx.job.manual_lat,
+                cx.job.manual_lon,
+                &gnss::clock::now_utc(),
+            )
+        }
         GgaSource::Receiver => {
             let last = cx.last_gga.read().ok().and_then(|g| g.as_ref().cloned());
             match last {
                 Some(raw) => format!("{raw}\r\n"),
                 None => {
-                    if conn.gga_unavailable_logged {
-                        cx.hub
-                            .event("No receiver GGA available yet; position not sent");
-                    } else {
-                        // First miss per connection explains cause + remedy
-                        // as two short lines (a single long sentence clips
-                        // its remedy off-screen); on the user's default
-                        // setup (Receiver source, no GPS attached) this is
-                        // the permanent state.
-                        conn.gga_unavailable_logged = true;
-                        cx.hub.event(
-                            "No receiver GGA available; position not sent \
-                             (no GPS receiver is connected)",
-                        );
-                        cx.hub.event(
-                            "Connect one on the Serial side, or switch the \
-                             profile's position source to manual",
-                        );
-                    }
-                    // Re-arm the timer: the receiver may produce a fix by the
-                    // next 10 s slot, and GgaDue never repeats without this.
-                    session.gga_sent(Instant::now());
+                    // On a receiver-source profile with no GPS attached this
+                    // is the permanent state; the miss notes explain it.
+                    note_gga_miss(cx, conn, &MISS_NO_RECEIVER);
+                    // Short-slot retry: the receiver's first fix should reach
+                    // the caster within ~2 s, not up to 10 s later - APIS
+                    // holds the stream until it arrives.
+                    session.gga_missed(Instant::now());
                     return;
                 }
             }
@@ -1151,8 +1209,13 @@ fn on_gga_due(cx: &mut Cx, session: &mut NtripSession, io: &mut Conn, conn: &mut
             cx.hub.conn(format!("> {}", sentence.trim_end()));
         }
         Err(e) => {
-            // The socket is dying; the read loop will surface the close.
+            // Usually the socket is dying and the read loop will surface the
+            // close - but re-arm the retry slot anyway: a connection that
+            // survives a transient write failure must not fall GGA-silent
+            // for its remaining lifetime (an APIS caster would then hold the
+            // stream forever, the exact deadlock this machinery prevents).
             cx.hub.event(format!("Failed to send GGA: {e}"));
+            session.gga_missed(Instant::now());
         }
     }
 }
@@ -1224,13 +1287,35 @@ mod tests {
                 stream_requires: false
             }
         );
-        // Unknown table -> assume not required (the worker logs this).
+        // Unknown requirement -> assume required and send (the worker logs
+        // this assumption). APIS-style casters hold the stream until a GGA
+        // arrives and never list their base-SN mounts in the sourcetable;
+        // only an explicit nmea=0 row may suppress sending.
         assert_eq!(
             gga_policy(GgaMode::WhenRequired, None),
             GgaPolicy::WhenRequired {
-                stream_requires: false
+                stream_requires: true
             }
         );
+    }
+
+    /// (0, 0) exactly means "never configured"; any real coordinate - even
+    /// one at a zero latitude OR longitude - is a position. Non-finite and
+    /// out-of-range values (a hand-edited settings.toml parses `nan`/`inf`
+    /// without complaint) must count as unset, never as something to
+    /// fabricate a sentence from.
+    #[test]
+    fn manual_position_zero_zero_and_garbage_mean_unset() {
+        assert!(!manual_position_set(0.0, 0.0));
+        assert!(!manual_position_set(-0.0, 0.0), "negative zero is still unset");
+        assert!(manual_position_set(35.1, -106.3));
+        assert!(manual_position_set(0.0, -106.3), "zero latitude is legal");
+        assert!(manual_position_set(51.5, 0.0), "zero longitude is legal");
+        assert!(!manual_position_set(f64::NAN, -106.3));
+        assert!(!manual_position_set(35.1, f64::NAN));
+        assert!(!manual_position_set(f64::INFINITY, 0.0));
+        assert!(!manual_position_set(91.0, 0.0), "latitude out of range");
+        assert!(!manual_position_set(0.0, -181.0), "longitude out of range");
     }
 
     #[test]
@@ -1376,44 +1461,66 @@ mod tests {
         assert_eq!(line, "Disconnected by user (after 25 s, 18.2 kB received)");
     }
 
-    /// One clause per GGA plan, shown with "Receiving data": the silent
-    /// when_required-with-unknown-table downgrade must be visible, and the
-    /// receiver arm must not claim GGA is flowing while no receiver fix
-    /// exists to send (the reporting user's exact setup).
+    /// One clause per GGA plan, shown with "Receiving data": every plan that
+    /// will send nothing (mode off, an nmea=0 row, no position configured)
+    /// must say so, and neither position arm may claim GGA is flowing while
+    /// nothing exists to send.
     #[test]
     fn gga_plan_covers_all_configurations() {
         use GgaMode::*;
         use GgaSource::*;
-        let p = gga_plan(Transport::RawTcp, Always, Some(true), Manual, true);
+        let p = gga_plan(Transport::RawTcp, Always, Some(true), Manual, true, true);
         assert_eq!(p, "GGA not applicable (raw TCP)");
         assert_eq!(
-            gga_plan(Transport::Ntrip, Off, Some(true), Manual, true),
+            gga_plan(Transport::Ntrip, Off, Some(true), Manual, true, true),
             "GGA off"
         );
-        // The silent trap: when_required + unknown table = send nothing.
+        // Unknown requirement now sends by default (the APIS fix): the plan
+        // reflects the receiver-wait state, not a silent downgrade.
         assert_eq!(
-            gga_plan(Transport::Ntrip, WhenRequired, None, Receiver, false),
+            gga_plan(Transport::Ntrip, WhenRequired, None, Receiver, false, false),
+            "will send receiver GGA every 10 s (none until the receiver supplies a fix)"
+        );
+        // Only an explicit nmea=0 row turns when_required off.
+        assert_eq!(
+            gga_plan(Transport::Ntrip, WhenRequired, Some(false), Receiver, false, false),
             "GGA off"
         );
         assert_eq!(
-            gga_plan(Transport::Ntrip, WhenRequired, Some(false), Receiver, false),
-            "GGA off"
-        );
-        assert_eq!(
-            gga_plan(Transport::Ntrip, WhenRequired, Some(true), Manual, false),
+            gga_plan(Transport::Ntrip, WhenRequired, Some(true), Manual, false, true),
             "sending GGA every 10 s (manual position)"
+        );
+        // Manual source with the coordinates never set: intent cannot be
+        // honored, and the plan must say why instead of claiming a send.
+        assert_eq!(
+            gga_plan(Transport::Ntrip, WhenRequired, None, Manual, false, false),
+            "GGA wanted but the manual position is not set - edit the profile"
         );
         // Receiver source with a fix in hand: passthrough is a fact.
         assert_eq!(
-            gga_plan(Transport::Ntrip, Always, None, Receiver, true),
+            gga_plan(Transport::Ntrip, Always, None, Receiver, true, false),
             "sending GGA every 10 s (receiver passthrough)"
         );
         // Receiver source with no fix yet: intent, not fact - the log must
         // not assert GGA is being sent when zero will go out.
         assert_eq!(
-            gga_plan(Transport::Ntrip, Always, None, Receiver, false),
+            gga_plan(Transport::Ntrip, Always, None, Receiver, false, false),
             "will send receiver GGA every 10 s (none until the receiver supplies a fix)"
         );
+    }
+
+    /// Every miss-note line must fit the default-width event log; the
+    /// remedy is exactly the part clipping would hide (the gga_hint test
+    /// pins the same rule for close-time hints).
+    #[test]
+    fn miss_note_lines_fit_the_default_width_log() {
+        for l in MISS_NO_RECEIVER
+            .iter()
+            .chain(MISS_NO_MANUAL.iter())
+            .chain(std::iter::once(&MISS_REPEAT))
+        {
+            assert!(l.len() <= 80, "{} chars: {l}", l.len());
+        }
     }
 
     /// The GGA-starvation hint fires only for kick-shaped closes of an NTRIP
@@ -1437,10 +1544,12 @@ mod tests {
         );
         assert!(remedy.contains("Enable Send GGA"), "{remedy}");
         assert!(hint(&CloseReason::StreamSilence, Some(true), 0, quick).is_some());
-        // Unknown requirement: hinted only on a fast death.
+        // Unknown requirement: hinted only on a fast death. Zero sends with
+        // the send-by-default policy means mode off or no position existed;
+        // the remedy points at both.
         let [diag, remedy] = hint(&CloseReason::RemoteClosed, None, 0, quick).unwrap();
         assert!(diag.contains("drop silent clients"), "{diag}");
-        assert!(remedy.contains("Fetch the sourcetable"), "{remedy}");
+        assert!(remedy.contains("position source"), "{remedy}");
         assert!(hint(&CloseReason::RemoteClosed, None, 0, long).is_none());
         // Table says no GGA needed: soft stale-table pointer on a fast
         // death only (a caster operator enabling the requirement after the

@@ -2,6 +2,34 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.2.1] - 2026-07-23
+
+Field fix: CHC APIS casters connected but never streamed ("Connected - waiting for data",
+then a silence timeout on loop). APIS answers `ICY 200 OK` and then holds the stream until
+the client sends any NMEA GGA - and its base-serial-number mountpoints are absent from its
+own sourcetable, so the old "send GGA only when the sourcetable requires it" default never
+sent one. Verified live against apis-usa.chcnav.com:2201 (`Server: CRNet 1.0`).
+
+### Changed
+
+- `when required` GGA mode now treats an unknown requirement (no sourcetable, or the mount
+  not listed in it) as "required" and sends a position; only an explicit nmea=0 sourcetable
+  entry suppresses it. Casters that do not want a GGA ignore it - withholding one deadlocks
+  APIS-style casters
+- A due GGA with no position to send (receiver source with no fix yet, manual position not
+  set) retries every 2 s instead of every 10 s, so the receiver's first fix reaches the
+  caster promptly instead of racing the 30 s silence timeout; the misses are explained in
+  the event log and stop repeating once corrections flow
+- A manual position left at its unset default (exactly 0, 0) now sends nothing and says so,
+  instead of fabricating a confident fix on Null Island for a VRS to act on - this applies
+  to `always` mode too
+
+### Added
+
+- `--selftest` accepts `--gga LAT,LON` (decimal degrees), which sends a manual-position GGA
+  regardless of the sourcetable: the headless way to certify an APIS-style caster and
+  customer credentials end to end
+
 ## [0.2.0] - 2026-07-17
 
 "One Surface" pass: the diagnostic windows that used to float are now one always-present
