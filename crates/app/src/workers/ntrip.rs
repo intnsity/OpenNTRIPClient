@@ -128,9 +128,7 @@ pub fn gga_policy(mode: GgaMode, stream_requires: Option<bool>) -> GgaPolicy {
 /// digits under a valid checksum. This guard is what makes the
 /// send-by-default `when_required` policy safe for manual-source profiles.
 pub fn manual_position_set(lat: f64, lon: f64) -> bool {
-    (-90.0..=90.0).contains(&lat)
-        && (-180.0..=180.0).contains(&lon)
-        && (lat != 0.0 || lon != 0.0)
+    (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) && (lat != 0.0 || lon != 0.0)
 }
 
 /// The reconnect gate: transient reason, user opted in, attempt budget left.
@@ -995,9 +993,7 @@ fn note_gga_miss(cx: &mut Cx, conn: &mut ConnState, texts: &[&str; 2]) {
             cx.hub.event(texts[1]);
             conn.last_miss_note = Some(now);
         }
-        Some(prev)
-            if !conn.streaming && now.duration_since(prev) >= MISS_NOTE_INTERVAL =>
-        {
+        Some(prev) if !conn.streaming && now.duration_since(prev) >= MISS_NOTE_INTERVAL => {
             cx.hub.event(MISS_REPEAT);
             conn.last_miss_note = Some(now);
         }
@@ -1307,7 +1303,10 @@ mod tests {
     #[test]
     fn manual_position_zero_zero_and_garbage_mean_unset() {
         assert!(!manual_position_set(0.0, 0.0));
-        assert!(!manual_position_set(-0.0, 0.0), "negative zero is still unset");
+        assert!(
+            !manual_position_set(-0.0, 0.0),
+            "negative zero is still unset"
+        );
         assert!(manual_position_set(35.1, -106.3));
         assert!(manual_position_set(0.0, -106.3), "zero latitude is legal");
         assert!(manual_position_set(51.5, 0.0), "zero longitude is legal");
@@ -1483,11 +1482,25 @@ mod tests {
         );
         // Only an explicit nmea=0 row turns when_required off.
         assert_eq!(
-            gga_plan(Transport::Ntrip, WhenRequired, Some(false), Receiver, false, false),
+            gga_plan(
+                Transport::Ntrip,
+                WhenRequired,
+                Some(false),
+                Receiver,
+                false,
+                false
+            ),
             "GGA off"
         );
         assert_eq!(
-            gga_plan(Transport::Ntrip, WhenRequired, Some(true), Manual, false, true),
+            gga_plan(
+                Transport::Ntrip,
+                WhenRequired,
+                Some(true),
+                Manual,
+                false,
+                true
+            ),
             "sending GGA every 10 s (manual position)"
         );
         // Manual source with the coordinates never set: intent cannot be

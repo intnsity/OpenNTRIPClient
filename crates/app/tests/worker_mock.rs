@@ -498,7 +498,10 @@ fn apis_style_caster_streams_only_after_gga() {
     events.extend(more);
     let received = server.join().unwrap();
 
-    assert!(streamed, "no corrections arrived: the GGA latch never opened");
+    assert!(
+        streamed,
+        "no corrections arrived: the GGA latch never opened"
+    );
     let received_text = String::from_utf8_lossy(&received);
     assert!(
         received_text.contains("$GPGGA"),
@@ -512,7 +515,10 @@ fn apis_style_caster_streams_only_after_gga() {
         "the unknown-requirement send assumption must be logged: {lines:?}"
     );
     let (_, failed) = stopped.expect("worker must stop");
-    assert!(!failed, "a user cancel of a healthy stream is not a failure");
+    assert!(
+        !failed,
+        "a user cancel of a healthy stream is not a failure"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

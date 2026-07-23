@@ -678,7 +678,15 @@ ENDSOURCETABLE\r\n",
         assert!(parse_gga("nope").is_err());
         assert!(parse_gga("1;2").is_err());
         assert_eq!(
-            run(&s(&["--selftest", "--host", "h", "--port", "1", "--gga", "0,0"])),
+            run(&s(&[
+                "--selftest",
+                "--host",
+                "h",
+                "--port",
+                "1",
+                "--gga",
+                "0,0"
+            ])),
             2,
             "0,0 must be a usage error, not a silent no-op run"
         );
