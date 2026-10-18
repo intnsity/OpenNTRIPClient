@@ -31,6 +31,11 @@ pub fn captures_dir(base: &Path) -> PathBuf {
     base.join("Captures")
 }
 
+/// Exported profile files (`*.oncprofile`).
+pub fn profiles_dir(base: &Path) -> PathBuf {
+    base.join("Profiles")
+}
+
 /// Marker the panic hook drops (holding the crash report's path) so the
 /// next run can announce the crash in its event log, then delete it.
 /// Deliberately in the base dir, NOT Logs: an uncreatable Logs dir is one

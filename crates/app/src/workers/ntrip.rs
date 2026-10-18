@@ -27,7 +27,7 @@ use ntrip_core::{
     CloseReason, GgaPolicy, NtripSession, NtripVersion, Output, SessionConfig, Transport,
 };
 
-use crate::bus::{AppEvent, Hub, NtripStatus, RtcmBatch};
+use crate::bus::{AppEvent, Hub, NtripStatus, PositionTrouble, RtcmBatch};
 use crate::logging::{CaptureTarget, LogCmd};
 use crate::settings::{GgaMode, GgaSource};
 use crate::workers::tls::{self, TlsFail};
@@ -174,20 +174,35 @@ pub fn mib_crossed(before: u64, after: u64) -> Option<u64> {
 }
 
 /// Event-log traffic milestone crossed by this chunk. The early proof points
-/// (10 kB, 100 kB) confirm a healthy stream within seconds at real RTCM
-/// rates (0.5-1 kB/s); a 1 MiB-only cadence left the log silent for 17-35
-/// minutes after "Receiving data", which users read as a dead stream.
-pub fn traffic_milestone(before: u64, after: u64) -> Option<String> {
-    if let Some(mib) = mib_crossed(before, after) {
-        return Some(format!("Received {mib} MiB"));
-    }
-    if before < 100_000 && after >= 100_000 {
-        return Some("Received 100 kB".to_string());
-    }
-    if before < 10_000 && after >= 10_000 {
-        return Some("Received 10 kB (stream healthy)".to_string());
-    }
-    None
+/// (10 kB, 100 kB) confirm a live stream within seconds at real RTCM rates
+/// (0.5-1 kB/s); a 1 MiB-only cadence left the log silent for 17-35 minutes
+/// after "Receiving data", which users read as a dead stream.
+///
+/// Bytes alone prove nothing about health: a receiver's raw port (Trimble
+/// RT27 and the like) flows steadily without one RTCM3 frame. So the verdict
+/// rides on the run's deframer totals - "clean" only when frames decoded
+/// with zero CRC failures, a warning when nothing has framed at all.
+pub fn traffic_milestone(
+    before: u64,
+    after: u64,
+    frames: u64,
+    crc_failures: u64,
+) -> Option<String> {
+    let mark = if let Some(mib) = mib_crossed(before, after) {
+        format!("{mib} MiB")
+    } else if before < 100_000 && after >= 100_000 {
+        "100 kB".to_string()
+    } else if before < 10_000 && after >= 10_000 {
+        "10 kB".to_string()
+    } else {
+        return None;
+    };
+    let verdict = match (frames, crc_failures) {
+        (0, _) => " - no RTCM3 frames yet",
+        (_, 0) => " - RTCM3 framing clean",
+        _ => "",
+    };
+    Some(format!("Received {mark}{verdict}"))
 }
 
 /// Human duration for event lines: sub-10 s keeps one decimal (first-data
@@ -220,6 +235,15 @@ pub fn fmt_bytes(n: u64) -> String {
 pub fn close_summary(reason: &CloseReason, mountpoint: &str) -> String {
     match reason {
         CloseReason::Unauthorized => "Invalid username or password".to_string(),
+        // SNIP-style casters (rtk2go) answer bad credentials with the
+        // sourcetable too; when that table lists the mount, the mount name
+        // is fine and blaming it sends the user after the wrong fix.
+        CloseReason::MountpointNotFound { sourcetable } if lists(sourcetable, mountpoint) => {
+            format!(
+                "The caster answered with its sourcetable, not the stream. \
+                 '{mountpoint}' is listed, so check User and Password."
+            )
+        }
         CloseReason::MountpointNotFound { .. } => format!(
             "Mountpoint '{mountpoint}' not found: the caster returned its sourcetable instead"
         ),
@@ -240,6 +264,15 @@ pub fn close_summary(reason: &CloseReason, mountpoint: &str) -> String {
         // indistinguishable from a caster drop; only a cancel produces this.
         CloseReason::Cancelled => "Disconnected by user".to_string(),
     }
+}
+
+/// Whether a raw sourcetable lists `mountpoint`. Case-insensitive because
+/// casters match mounts that way on the wire (see AppState::str_record).
+fn lists(sourcetable: &[u8], mountpoint: &str) -> bool {
+    ntrip_core::sourcetable::parse(sourcetable)
+        .strs
+        .iter()
+        .any(|s| s.mountpoint.eq_ignore_ascii_case(mountpoint))
 }
 
 /// The full close line for the event and connection logs: the plain-words
@@ -351,10 +384,89 @@ pub fn gga_hint(
         // kick-shaped close. Soft pointer only on a fast death.
         Some(false) if died_fast => Some([
             "The cached sourcetable says this mount needs no GGA (nmea=0)".to_string(),
-            "If that table is old it may be wrong - refetch it with Get Sourcetable".to_string(),
+            "If that table is old it may be wrong - refetch it (Sourcetable tab > Refresh)"
+                .to_string(),
         ]),
         _ => None,
     }
+}
+
+/// How long an accepted connection may sit silent, with no GGA sent, before
+/// the worker suspects the caster is waiting for a position. Well past
+/// normal first-data latency (~1 s), well short of the 30 s silence timeout
+/// the user would otherwise stare through.
+pub const STARVE_HINT_AFTER: Duration = Duration::from_secs(5);
+
+/// Whether a missing position could explain this job's trouble at all: only
+/// an NTRIP mountpoint request carries GGA, and an explicit nmea=0 row
+/// already has its own stale-table hint (see gga_hint).
+pub fn position_matters(
+    transport: Transport,
+    mountpoint: &str,
+    stream_requires: Option<bool>,
+) -> bool {
+    matches!(transport, Transport::Ntrip)
+        && !mountpoint.is_empty()
+        && stream_requires != Some(false)
+}
+
+/// The live starvation suspicion: the caster answered (and has not closed),
+/// no correction byte has arrived for STARVE_HINT_AFTER, and no GGA went
+/// out. `answered_for` is None until the caster's first response line.
+pub fn starving(
+    answered_for: Option<Duration>,
+    streaming: bool,
+    gga_sent: u32,
+    matters: bool,
+) -> bool {
+    matters && !streaming && gga_sent == 0 && answered_for.is_some_and(|d| d >= STARVE_HINT_AFTER)
+}
+
+/// The position verdict for a close. A kick-shaped close with zero GGA sent
+/// (exactly gga_hint's diagnosis) is starvation; a classified non-auth
+/// refusal while the profile had no position to offer may be a geofence.
+/// `position_ready` is whether this connection would have sent a GGA (mode
+/// on and a position exists) - a refusal is never the GGA's fault otherwise.
+pub fn position_verdict(
+    reason: &CloseReason,
+    transport: Transport,
+    mountpoint: &str,
+    stream_requires: Option<bool>,
+    gga_sent: u32,
+    connected_for: Duration,
+    position_ready: bool,
+) -> Option<PositionTrouble> {
+    if !position_matters(transport, mountpoint, stream_requires) {
+        return None;
+    }
+    if gga_hint(
+        reason,
+        transport,
+        mountpoint,
+        stream_requires,
+        gga_sent,
+        connected_for,
+    )
+    .is_some()
+    {
+        return Some(PositionTrouble::Starved);
+    }
+    // Only a 403 is plausibly a geofence. A 404 is a wrong mountpoint and a
+    // 5xx a caster fault; blaming the position for those sends the user
+    // after the wrong fix.
+    let forbidden = match reason {
+        CloseReason::UnknownResponse { raw } => status_code(raw) == Some(403),
+        _ => false,
+    };
+    (forbidden && !position_ready).then_some(PositionTrouble::Refused)
+}
+
+/// The three-digit status code of an HTTP/ICY/RTSP-style first line
+/// ("HTTP/1.1 403 Forbidden"), if the response has one.
+fn status_code(raw: &[u8]) -> Option<u16> {
+    let line = raw.split(|&b| b == b'\n').next()?;
+    let code = std::str::from_utf8(line).ok()?.split_whitespace().nth(1)?;
+    (code.len() == 3).then(|| code.parse().ok()).flatten()
 }
 
 /// The negative reconnect decision, spelled out. The positive path already
@@ -373,7 +485,7 @@ pub fn no_reconnect_line(
     }
     match policy {
         ReconnectPolicy::OneShot if is_table => {
-            "Sourcetable fetches are one-shot - use Get Sourcetable to retry".to_string()
+            "Sourcetable fetches are one-shot - use Get sourcetable to retry".to_string()
         }
         ReconnectPolicy::OneShot => "This run is one-shot - not reconnecting".to_string(),
         ReconnectPolicy::OptionsOff => {
@@ -418,9 +530,16 @@ pub struct NtripHandle {
     cancel: Arc<AtomicBool>,
     sock: Arc<Mutex<Option<TcpStream>>>,
     join: Option<JoinHandle<()>>,
+    table_request: bool,
 }
 
 impl NtripHandle {
+    /// The job is a sourcetable fetch, not a stream: lets the UI tell a
+    /// table the user asked for from one a mount request fell back to.
+    pub fn is_table_request(&self) -> bool {
+        self.table_request
+    }
+
     /// Cooperative cancel that actually unblocks: sets the flag, then
     /// shutdowns the socket clone so a blocked read returns immediately.
     pub fn cancel(&self) {
@@ -460,6 +579,7 @@ pub fn spawn(
     let sock = Arc::new(Mutex::new(None));
     let cancel2 = cancel.clone();
     let sock2 = sock.clone();
+    let table_request = job.is_table_request();
     let join = std::thread::Builder::new()
         .name("ntrip".to_string())
         .spawn(move || {
@@ -474,6 +594,7 @@ pub fn spawn(
                 drops: 0,
                 alert_armed: false,
                 total_bytes: 0,
+                frames_total: 0,
                 crc_base: 0,
                 garbage_base: 0,
                 last_health_posted: (0, 0),
@@ -481,6 +602,7 @@ pub fn spawn(
                 gga_assumption_logged: false,
                 gga_off_warning_logged: false,
                 mount_encoding_logged: false,
+                position_hint_logged: [false; 2],
             };
             let (summary, failed) = supervise(&mut cx);
             cx.hub
@@ -491,6 +613,7 @@ pub fn spawn(
         cancel,
         sock,
         join: Some(join),
+        table_request,
     }
 }
 
@@ -517,6 +640,8 @@ struct Cx {
     /// yet, and the retries themselves, stay silent.
     alert_armed: bool,
     total_bytes: u64,
+    /// RTCM3 frames decoded this run; gates the milestone's health verdict.
+    frames_total: u64,
     /// CRC failures from deframers of previous connections this run.
     crc_base: u64,
     /// Garbage bytes from deframers of previous connections this run.
@@ -531,11 +656,51 @@ struct Cx {
     /// One plain-words notice per run when the mountpoint had to be
     /// percent-encoded for the request line.
     mount_encoding_logged: bool,
+    /// The position hint reaches the event log once per run; the UI keeps
+    /// showing the live verdict, so repeating it per retry is only noise.
+    position_hint_logged: [bool; 2],
 }
 
 impl Cx {
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// Would this connection send a GGA right now: the policy is on and a
+    /// position exists to send (the same facts gga_plan words).
+    fn position_ready(&self) -> bool {
+        let enabled = match gga_policy(self.job.gga_mode, self.job.stream_requires_gga) {
+            GgaPolicy::Off => false,
+            GgaPolicy::Always => true,
+            GgaPolicy::WhenRequired { stream_requires } => stream_requires,
+        };
+        enabled
+            && match self.job.gga_source {
+                GgaSource::Manual => manual_position_set(self.job.manual_lat, self.job.manual_lon),
+                GgaSource::Receiver => self.last_gga.read().is_ok_and(|g| g.is_some()),
+            }
+    }
+
+    fn position_matters(&self) -> bool {
+        position_matters(
+            self.job.transport,
+            &self.job.mountpoint,
+            self.job.stream_requires_gga,
+        )
+    }
+
+    /// Post a position verdict to the UI, and its one-sentence remedy to the
+    /// event log the first time this run sees that kind.
+    fn report_trouble(&mut self, trouble: PositionTrouble) {
+        self.hub.status(AppEvent::PositionTrouble(Some(trouble)));
+        let logged = match trouble {
+            PositionTrouble::Starved => &mut self.position_hint_logged[0],
+            PositionTrouble::Refused => &mut self.position_hint_logged[1],
+        };
+        if !*logged {
+            *logged = true;
+            self.hub.event(trouble.hint());
+        }
     }
 }
 
@@ -608,6 +773,9 @@ fn supervise(cx: &mut Cx) -> (String, bool) {
         if cx.cancelled() {
             return (CANCEL_SUMMARY.to_string(), false);
         }
+        // A reconnecting session never posts Stopped, so without this the
+        // band could not say why the stream it is retrying went away.
+        cx.hub.status(AppEvent::LastClose(summary.clone()));
         // "Alert on drop": an established stream failing rings the bell once
         // per outage, whether or not a reconnect follows. Failures before any
         // stream (bad network on Connect) and the retries themselves are
@@ -814,6 +982,14 @@ fn drive_connection(cx: &mut Cx, sock: TcpStream) -> SessionEnd {
         Ok(io) => io,
         Err(end) => return end,
     };
+    // Raw TCP exchanges no protocol lines, so without this the Connection
+    // log shows nothing of the session - or a stale line from the last one.
+    if matches!(cx.job.transport, Transport::RawTcp) {
+        cx.hub.conn(format!(
+            "TCP connected {}:{} - raw, no NTRIP handshake",
+            cx.job.host, cx.job.port
+        ));
+    }
 
     let stream_requires = cx.job.stream_requires_gga;
     if matches!(cx.job.gga_mode, GgaMode::WhenRequired)
@@ -894,6 +1070,8 @@ fn drive_connection(cx: &mut Cx, sock: TcpStream) -> SessionEnd {
         bytes_at_connect: cx.total_bytes,
         gga_sent: 0,
         last_miss_note: None,
+        answered_at: None,
+        starve_noted: false,
         terminal: None,
     };
     let mut buf = [0u8; 8192];
@@ -940,6 +1118,17 @@ fn drive_connection(cx: &mut Cx, sock: TcpStream) -> SessionEnd {
             }
         }
         session.on_tick(Instant::now(), &mut outs);
+        if !conn.starve_noted
+            && starving(
+                conn.answered_at.map(|t| t.elapsed()),
+                conn.streaming,
+                conn.gga_sent,
+                cx.position_matters(),
+            )
+        {
+            conn.starve_noted = true;
+            cx.report_trouble(PositionTrouble::Starved);
+        }
     }
 }
 
@@ -960,6 +1149,11 @@ struct ConnState {
     /// When the last due-GGA miss was logged, None before the first. Misses
     /// retry every 2 s, far too often to log each one; see note_gga_miss.
     last_miss_note: Option<Instant>,
+    /// When the caster's first response line arrived; anchors the live
+    /// starvation check so a slow answer is not mistaken for a held stream.
+    answered_at: Option<Instant>,
+    /// The live starvation verdict fires once per connection.
+    starve_noted: bool,
     terminal: Option<SessionEnd>,
 }
 
@@ -1017,6 +1211,7 @@ fn dispatch(
                 cx.hub.conn(format!("> {line}"));
             }
             Output::ProtocolRx(line) => {
+                conn.answered_at.get_or_insert_with(Instant::now);
                 cx.hub.event(format!("< {line}"));
                 cx.hub.conn(format!("< {line}"));
             }
@@ -1066,6 +1261,21 @@ fn dispatch(
                         cx.hub.conn(line);
                     }
                 }
+                // Posted either way: a close with its own diagnosis (401,
+                // ...) must withdraw an earlier connection's position hint,
+                // or the band would blame GGA for a credentials failure.
+                match position_verdict(
+                    &reason,
+                    cx.job.transport,
+                    &cx.job.mountpoint,
+                    cx.job.stream_requires_gga,
+                    conn.gga_sent,
+                    connected_for,
+                    cx.position_ready(),
+                ) {
+                    Some(trouble) => cx.report_trouble(trouble),
+                    None => cx.hub.status(AppEvent::PositionTrouble(None)),
+                }
                 if conn.terminal.is_none() {
                     conn.terminal = Some(SessionEnd::Closed(reason));
                 }
@@ -1100,9 +1310,6 @@ fn on_corrections(cx: &mut Cx, conn: &mut ConnState, bytes: &[u8]) {
     }
     let before = cx.total_bytes;
     cx.total_bytes += bytes.len() as u64;
-    if let Some(milestone) = traffic_milestone(before, cx.total_bytes) {
-        cx.hub.event(milestone);
-    }
 
     match cx.corr.push(bytes.to_vec()) {
         PushOutcome::Inactive | PushOutcome::Queued => {}
@@ -1131,6 +1338,17 @@ fn on_corrections(cx: &mut Cx, conn: &mut ConnState, bytes: &[u8]) {
     deframe(conn, bytes, &mut batch);
     batch.crc_failures = cx.crc_base + conn.deframer.crc_failures;
     batch.garbage_bytes = cx.garbage_base + conn.deframer.garbage_bytes;
+    // Judged after deframing so the milestone sees this chunk's frames.
+    cx.frames_total += batch
+        .frames
+        .iter()
+        .map(|&(_, n, _)| u64::from(n))
+        .sum::<u64>();
+    if let Some(milestone) =
+        traffic_milestone(before, cx.total_bytes, cx.frames_total, batch.crc_failures)
+    {
+        cx.hub.event(milestone);
+    }
     let health = (batch.crc_failures, batch.garbage_bytes);
     if !batch.frames.is_empty() || health != cx.last_health_posted {
         cx.last_health_posted = health;
@@ -1201,6 +1419,11 @@ fn on_gga_due(cx: &mut Cx, session: &mut NtripSession, io: &mut Conn, conn: &mut
     match io.write_all(sentence.as_bytes()) {
         Ok(()) => {
             conn.gga_sent += 1;
+            if conn.gga_sent == 1 {
+                // A position is reaching the caster now: any verdict that
+                // blamed its absence (this attempt or the last) is void.
+                cx.hub.status(AppEvent::PositionTrouble(None));
+            }
             session.gga_sent(Instant::now());
             cx.hub.conn(format!("> {}", sentence.trim_end()));
         }
@@ -1397,25 +1620,65 @@ mod tests {
     #[test]
     fn traffic_milestones_early_then_mib() {
         const MIB: u64 = 1 << 20;
-        assert_eq!(traffic_milestone(0, 500), None);
+        let clean = |before, after| traffic_milestone(before, after, 12, 0);
+        assert_eq!(clean(0, 500), None);
         assert_eq!(
-            traffic_milestone(9_999, 10_400).as_deref(),
-            Some("Received 10 kB (stream healthy)")
+            clean(9_999, 10_400).as_deref(),
+            Some("Received 10 kB - RTCM3 framing clean")
         );
         // Already past 10 kB: no repeat.
-        assert_eq!(traffic_milestone(10_400, 11_000), None);
+        assert_eq!(clean(10_400, 11_000), None);
         assert_eq!(
-            traffic_milestone(99_000, 101_000).as_deref(),
-            Some("Received 100 kB")
+            clean(99_000, 101_000).as_deref(),
+            Some("Received 100 kB - RTCM3 framing clean")
         );
         assert_eq!(
-            traffic_milestone(MIB - 1, MIB).as_deref(),
-            Some("Received 1 MiB")
+            clean(MIB - 1, MIB).as_deref(),
+            Some("Received 1 MiB - RTCM3 framing clean")
         );
         // A chunk crossing both an early mark and a MiB reports the MiB.
         assert_eq!(
-            traffic_milestone(0, 2 * MIB).as_deref(),
-            Some("Received 2 MiB")
+            clean(0, 2 * MIB).as_deref(),
+            Some("Received 2 MiB - RTCM3 framing clean")
+        );
+    }
+
+    /// Bytes are not health: the verdict follows decoded frames, so a raw
+    /// receiver port (bytes, zero RTCM3) is never called clean.
+    #[test]
+    fn traffic_milestone_verdict_follows_frames_and_crc() {
+        assert_eq!(
+            traffic_milestone(0, 10_000, 0, 0).as_deref(),
+            Some("Received 10 kB - no RTCM3 frames yet")
+        );
+        assert_eq!(
+            traffic_milestone(0, 10_000, 0, 4).as_deref(),
+            Some("Received 10 kB - no RTCM3 frames yet")
+        );
+        // Frames, but some failed CRC: neither clean nor frameless.
+        assert_eq!(
+            traffic_milestone(0, 10_000, 30, 2).as_deref(),
+            Some("Received 10 kB")
+        );
+    }
+
+    /// A sourcetable answer to a mount request blames the mount only when
+    /// the table does not list it; a listed mount means a SNIP-style caster
+    /// rejected the credentials.
+    #[test]
+    fn mountpoint_not_found_wording_follows_the_table() {
+        let sourcetable =
+            b"STR;REAL1;City;RTCM 3.2;;2;GPS;;DEU;50.0;8.6;0;1;Gen;none;B;N;520\r\nENDSOURCETABLE\r\n"
+                .to_vec();
+        let reason = CloseReason::MountpointNotFound { sourcetable };
+        assert_eq!(
+            close_summary(&reason, "real1"),
+            "The caster answered with its sourcetable, not the stream. \
+             'real1' is listed, so check User and Password."
+        );
+        assert_eq!(
+            close_summary(&reason, "TYPO"),
+            "Mountpoint 'TYPO' not found: the caster returned its sourcetable instead"
         );
     }
 
@@ -1609,6 +1872,86 @@ mod tests {
         );
     }
 
+    /// The position verdict: starvation exactly where gga_hint diagnoses it,
+    /// a refusal only for a classified non-auth answer with no position on
+    /// offer, and nothing for jobs where GGA cannot matter.
+    #[test]
+    fn position_verdict_truth_table() {
+        let quick = Duration::from_secs(5);
+        let refusal = CloseReason::UnknownResponse {
+            raw: b"HTTP/1.1 403 Forbidden\r\n\r\n".to_vec(),
+        };
+        let v = |reason: &CloseReason, requires, sent, ready| {
+            position_verdict(reason, Transport::Ntrip, "M", requires, sent, quick, ready)
+        };
+        use PositionTrouble::*;
+        assert_eq!(
+            v(&CloseReason::StreamSilence, None, 0, false),
+            Some(Starved)
+        );
+        assert_eq!(
+            v(&CloseReason::RemoteClosed, Some(true), 0, true),
+            Some(Starved)
+        );
+        // A GGA went out: the caster heard a position, not starvation.
+        assert_eq!(v(&CloseReason::RemoteClosed, None, 3, true), None);
+        assert_eq!(v(&refusal, None, 0, false), Some(Refused));
+        // With a position ready the refusal is not about GGA.
+        assert_eq!(v(&refusal, None, 0, true), None);
+        // Auth failures and line-less drops are never position trouble.
+        assert_eq!(v(&CloseReason::Unauthorized, None, 0, false), None);
+        let drop = CloseReason::UnknownResponse {
+            raw: b"ICY".to_vec(),
+        };
+        assert_eq!(v(&drop, None, 0, false), None);
+        // A wrong mountpoint or a caster fault is not a geofence.
+        for line in [
+            &b"HTTP/1.1 404 Not Found\r\n\r\n"[..],
+            b"HTTP/1.1 503 Busy\r\n\r\n",
+        ] {
+            let other = CloseReason::UnknownResponse { raw: line.to_vec() };
+            assert_eq!(v(&other, None, 0, false), None);
+        }
+        // nmea=0 has its own stale-table hint; raw TCP and tables no GGA.
+        assert_eq!(v(&CloseReason::StreamSilence, Some(false), 0, false), None);
+        assert_eq!(
+            position_verdict(&refusal, Transport::RawTcp, "M", None, 0, quick, false),
+            None
+        );
+        assert_eq!(
+            position_verdict(&refusal, Transport::Ntrip, "", None, 0, quick, false),
+            None
+        );
+    }
+
+    /// Live starvation needs an answered, still-silent, GGA-less connection
+    /// past the threshold - a slow first answer does not count.
+    #[test]
+    fn starving_requires_answer_silence_and_no_gga() {
+        let long = Some(STARVE_HINT_AFTER);
+        assert!(starving(long, false, 0, true));
+        assert!(!starving(None, false, 0, true), "caster has not answered");
+        assert!(!starving(Some(Duration::from_secs(1)), false, 0, true));
+        assert!(!starving(long, true, 0, true), "data is flowing");
+        assert!(!starving(long, false, 1, true), "a GGA went out");
+        assert!(!starving(long, false, 0, false), "GGA cannot matter");
+        assert!(position_matters(Transport::Ntrip, "M", None));
+        assert!(!position_matters(Transport::Ntrip, "M", Some(false)));
+        assert!(!position_matters(Transport::Ntrip, "", None));
+        assert!(!position_matters(Transport::RawTcp, "M", Some(true)));
+    }
+
+    /// Each hint is one sentence, ASCII, and short enough for the band.
+    #[test]
+    fn position_hints_are_one_short_sentence() {
+        for t in [PositionTrouble::Starved, PositionTrouble::Refused] {
+            let h = t.hint();
+            assert!(h.is_ascii() && h.ends_with('.'), "{h}");
+            assert_eq!(h.matches(". ").count(), 0, "one sentence: {h}");
+            assert!(h.len() <= 100, "{} chars: {h}", h.len());
+        }
+    }
+
     /// The negative reconnect decision always has words; permanence beats
     /// the policy explanations, and one-shot jobs (sourcetable fetches,
     /// --selftest) must never blame the Options setting they do not consult.
@@ -1626,7 +1969,7 @@ mod tests {
         // never consulted (and may even be enabled).
         let l = no_reconnect_line(true, OneShot, true, 10_000);
         assert!(l.contains("Sourcetable fetches are one-shot"), "{l}");
-        assert!(l.contains("Get Sourcetable"), "{l}");
+        assert!(l.contains("Get sourcetable"), "{l}");
         assert!(!l.contains("Options"), "{l}");
         // A one-shot stream run (--selftest) has no Options either.
         let l = no_reconnect_line(true, OneShot, false, 1);

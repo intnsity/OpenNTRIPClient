@@ -102,8 +102,11 @@ pub fn tab(app: &mut App, ui: &mut egui::Ui) {
                 // Reserve the footer strip before the table claims the
                 // remaining height, then render bottom-up-free: table
                 // shrinks, footer always stays visible.
+                // The footer row holds buttons, so it is a control row
+                // tall, plus the separator above it - sized as text it was
+                // clipped under the graph strip.
                 let footer_h =
-                    ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
+                    ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 2.0 + 6.0;
                 let table_h =
                     (ui.available_height() - footer_h - ui.spacing().item_spacing.y * 2.0).max(0.0);
                 body(ui, view, t, table_h, &mut pending);
@@ -328,7 +331,7 @@ fn str_table(
                             painter.rect_filled(
                                 hover_bar_rect(resp.rect),
                                 egui::CornerRadius::ZERO,
-                                theme::ACCENT,
+                                theme::accent(),
                             );
                         }
                     });

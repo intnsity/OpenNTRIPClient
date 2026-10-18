@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use gnss::rtcm::decode::Decoded;
 use ntrip_core::sourcetable::SourceTable;
 
-use crate::bus::{AppEvent, NtripStatus, SerialStatus};
+use crate::bus::{AppEvent, NtripStatus, PositionTrouble, SerialStatus};
 
 /// Fixed-capacity line ring: pushing past capacity drops the oldest line.
 /// Backs both log panes; the caps guarantee bounded memory on day-long runs.
@@ -247,6 +247,10 @@ pub struct GnssState {
     /// readouts can explain themselves as "needs a GPS receiver" instead of
     /// showing a bare dash forever.
     pub nmea_seen: bool,
+    /// When the last sentence parsed. `has_fix_data` latches for the run,
+    /// so this is what tells a live fix from the last word of a receiver
+    /// that has since been unplugged or gone quiet.
+    pub last_nmea: Option<Instant>,
 }
 
 impl GnssState {
@@ -268,11 +272,18 @@ impl GnssState {
             lon_deg: None,
             has_fix_data: false,
             nmea_seen: false,
+            last_nmea: None,
         }
     }
 
-    fn apply(&mut self, sentence: &gnss::nmea::Sentence) {
+    /// Time since the receiver last spoke; None before its first sentence.
+    pub fn nmea_age(&self, now: Instant) -> Option<Duration> {
+        self.last_nmea.map(|t| now.saturating_duration_since(t))
+    }
+
+    fn apply(&mut self, sentence: &gnss::nmea::Sentence, now: Instant) {
         self.nmea_seen = true;
+        self.last_nmea = Some(now);
         match sentence {
             gnss::nmea::Sentence::Gga(g) => {
                 self.has_fix_data = true;
@@ -310,6 +321,11 @@ impl GnssState {
 /// casters).
 pub const STALL_AFTER: Duration = Duration::from_secs(2);
 
+/// Receiver silence after which its last fix stops reading as live. NMEA
+/// runs at 1-10 Hz, so three missed seconds is a receiver that has stopped,
+/// not one between sentences.
+pub const RECEIVER_SILENT_AFTER: Duration = Duration::from_secs(3);
+
 pub struct NtripUi {
     pub status: NtripStatus,
     pub total_bytes: u64,
@@ -341,9 +357,20 @@ pub struct NtripUi {
     /// acks the generation it has shown (`App.conn_unknown_ack`); the tab's
     /// attention badge fires while gen is ahead of the ack.
     pub unknown_response_gen: u64,
+    /// The worker's verdict that the caster may want a position; survives
+    /// reconnect waits (the cause persists) and clears when data flows, a
+    /// GGA goes out, or the user starts a new session.
+    pub position_trouble: Option<PositionTrouble>,
+    /// Why this session's last connection ended; the band shows it while
+    /// RECONNECTING, the one state with no summary of its own.
+    pub last_close: Option<String>,
 }
 
 impl NtripUi {
+    pub fn last_close_reason(&self) -> Option<&str> {
+        self.last_close.as_deref()
+    }
+
     /// Seconds since correction bytes last arrived, measured from the start
     /// of the current status when no data has come yet. None outside the
     /// data-bearing states - nothing can stall while disconnected.
@@ -353,6 +380,12 @@ impl NtripUi {
             NtripStatus::Streaming | NtripStatus::WaitingForData
         )
         .then(|| now.duration_since(self.last_rx.unwrap_or(self.status_since)))
+    }
+
+    /// One-sentence remedy when the caster may be starving or refusing this
+    /// client for want of a position; None when that is not the story.
+    pub fn position_hint(&self) -> Option<&'static str> {
+        self.position_trouble.map(PositionTrouble::hint)
     }
 
     /// True when a live connection has gone quiet past `STALL_AFTER`.
@@ -373,6 +406,8 @@ impl NtripUi {
         self.antenna = None;
         self.text_1029 = None;
         self.biases_1230 = None;
+        self.position_trouble = None;
+        self.last_close = None;
     }
 }
 
@@ -422,6 +457,8 @@ impl AppState {
                 biases_1230: None,
                 last_unknown_response: None,
                 unknown_response_gen: 0,
+                position_trouble: None,
+                last_close: None,
             },
             serial: SerialUi {
                 status: SerialStatus::Disconnected {
@@ -442,9 +479,13 @@ impl AppState {
             AppEvent::EventLine(line) => self.events.push(line),
             AppEvent::ConnLine(line) => self.conn.push(line),
             AppEvent::Ntrip(status) => {
+                if status == NtripStatus::Streaming {
+                    self.ntrip.position_trouble = None;
+                }
                 self.ntrip.status = status;
                 self.ntrip.status_since = now;
             }
+            AppEvent::LastClose(summary) => self.ntrip.last_close = Some(summary),
             AppEvent::RxBytes { total } => {
                 // The counter only ever grows within a session; a growth tick
                 // IS the arrival signal the activity indicator pulses on.
@@ -489,8 +530,9 @@ impl AppState {
                 self.ntrip.last_unknown_response = Some(raw);
                 self.ntrip.unknown_response_gen += 1;
             }
+            AppEvent::PositionTrouble(t) => self.ntrip.position_trouble = t,
             AppEvent::Nmea(sentence) => {
-                self.gnss.apply(&sentence);
+                self.gnss.apply(&sentence, now);
                 if self.chart.recording
                     && let gnss::nmea::Sentence::Gga(g) = &sentence
                     && let Some(alt) = g.alt_m
@@ -842,6 +884,75 @@ mod tests {
         state.apply(AppEvent::Nmea(rmc), Instant::now());
         assert!(state.gnss.nmea_seen);
         assert!(!state.gnss.has_fix_data, "RMC alone is not fix data");
+    }
+
+    /// Any parsed sentence stamps the receiver's last word, so the banner
+    /// can tell a live fix from a latched one.
+    #[test]
+    fn nmea_age_tracks_the_last_sentence() {
+        let t0 = Instant::now();
+        let mut state = AppState::new(t0);
+        assert_eq!(state.gnss.nmea_age(t0), None);
+        let body = "GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W";
+        let ck = body.bytes().fold(0u8, |a, b| a ^ b);
+        let rmc = gnss::nmea::parse(&format!("${body}*{ck:02X}")).unwrap();
+        state.apply(AppEvent::Nmea(rmc), t0 + Duration::from_secs(1));
+        assert_eq!(
+            state.gnss.nmea_age(t0 + Duration::from_secs(5)),
+            Some(Duration::from_secs(4))
+        );
+    }
+
+    /// The position verdict's lifecycle: set by the worker, kept through a
+    /// reconnect wait, cleared by flowing data, a withdrawal, or a new
+    /// session.
+    #[test]
+    fn position_trouble_lifecycle() {
+        let now = Instant::now();
+        let mut state = AppState::new(now);
+        assert_eq!(state.ntrip.position_hint(), None);
+        let starved = AppEvent::PositionTrouble(Some(PositionTrouble::Starved));
+        state.apply(starved.clone(), now);
+        let hint = state.ntrip.position_hint().expect("hint shown");
+        assert!(hint.contains("position"), "{hint}");
+        state.apply(
+            AppEvent::Ntrip(NtripStatus::ReconnectWait { next_attempt: 2 }),
+            now,
+        );
+        assert!(state.ntrip.position_hint().is_some(), "cause persists");
+        state.apply(AppEvent::Ntrip(NtripStatus::Streaming), now);
+        assert_eq!(state.ntrip.position_hint(), None, "data flows");
+
+        state.apply(starved.clone(), now);
+        state.apply(AppEvent::PositionTrouble(None), now);
+        assert_eq!(state.ntrip.position_hint(), None, "a GGA went out");
+
+        state.apply(starved, now);
+        state.ntrip.reset_stream_stats();
+        assert_eq!(state.ntrip.position_hint(), None, "new session");
+    }
+
+    /// The last close reason outlives the reconnect wait it explains and
+    /// belongs to one session only.
+    #[test]
+    fn last_close_reason_lifecycle() {
+        let now = Instant::now();
+        let mut state = AppState::new(now);
+        assert_eq!(state.ntrip.last_close_reason(), None);
+        state.apply(
+            AppEvent::LastClose("Connection closed by the caster".into()),
+            now,
+        );
+        state.apply(
+            AppEvent::Ntrip(NtripStatus::ReconnectWait { next_attempt: 2 }),
+            now,
+        );
+        assert_eq!(
+            state.ntrip.last_close_reason(),
+            Some("Connection closed by the caster")
+        );
+        state.ntrip.reset_stream_stats();
+        assert_eq!(state.ntrip.last_close_reason(), None, "new session");
     }
 
     #[test]

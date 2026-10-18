@@ -2,6 +2,73 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.3.0] - 2026-10-18
+
+A UX pass: the same power, easier to digest. The window now reads set up -> verdict ->
+evidence, every dialog behaves the same way, and profiles are named by you and shareable as
+small files.
+
+### Added
+
+- **Session band** under the caster card: the one place that answers "is it working?" -
+  `NOT CONNECTED` / `CONNECTING` / `STREAMING` / `NO DATA FOR N s` / `RECEIVING - NOT RTCM3` /
+  `FAILED` in its semantic color with a colored left rule, the target, session total, rate and
+  activity bar, and a second line with the stream summary or the next step
+- **Position hints**: when a caster accepts but starves the connection, or refuses it for a
+  reason other than credentials, while no GGA position was sent, the band says so in one
+  sentence and a click opens GGA position reporting; the GGA header turns orange with
+  "- no position to send" when GGA is on but there is nothing to send
+- **Save as profile...**: set up a caster on the main window, Connect to check it, then keep it
+  under your own name (suggested from the stream). The source profile keeps its saved settings
+- **Profile export and import**: **Export...** writes one or all profiles to a small
+  `.oncprofile` file (passwords optional); **Import...**, drag and drop, or opening the app with
+  the file brings them in, with per-profile rename or replace. A whole `settings.toml` from
+  another install imports too
+- **Colorways**: Butter Paper, Southwest Night and Nordic Night (ButterPaper v2 tokens),
+  switched from the appearance icon on the profile bar and remembered
+- **Not-RTCM3 diagnosis**: bytes that never frame as RTCM3 (Trimble RT27, CMR) read as such on
+  the band and in Stream detail instead of a green "Streaming"
+- README "Change it yourself": prerequisites, build, a worked label edit, the checks, and
+  where each part of the screen lives; `scripts/dev.ps1` runs or checks in one command
+
+### Changed
+
+- Layout: "1 Caster" first with the window's one solid primary button, which says what it will
+  do (**Connect** / **Get sourcetable** / **Disconnect**, with the reason underneath when it
+  cannot be pressed); "2 Receiver (optional)" beside it with baud, framing and NovAtel in a
+  self-describing **Port settings** disclosure; diagnostic tabs framed as one card; empty states
+  teach the next step
+- Caster card: one **Protocol** choice (NTRIP 1.0 / NTRIP 2.0 / Raw TCP); **Mountpoint** with a
+  proper picker button; **Browse mounts** fetches the sourcetable when needed; "show" password
+  checkbox; "Fields are locked while connected" stated on the card
+- Receiver readouts: the fix banner says `No receiver` / `Waiting for NMEA` / `No GGA from
+  receiver`, and a fix greys out with "(receiver silent)" or "(last seen ...)" once NMEA stops
+  instead of staying green
+- One dialog pattern: Options, About, Profiles and their prompts are modal cards with a title
+  and an X; Esc closes them; information dialogs also close on a click outside, dialogs with
+  edits close only on purpose. **Options** gets **Done** / **Cancel** (Cancel reverts)
+- Profiles window behaves like any profiles manager: rows show the caster each profile points
+  at and a green ACTIVE badge; one primary action, **Use profile** (Enter and double-click too);
+  keyboard (Up/Down, Enter, F2, Delete, Alt+Up/Down to reorder) and a right-click menu; rename
+  is explicit (Enter/OK saves, Esc/Cancel abandons, clicking elsewhere never commits); a taken
+  name is refused in place, never silently suffixed; New... and Duplicate... ask for the name
+  first; rows tag "unsaved edits"; delete confirms in a dialog; disabled actions explain
+  themselves under the button
+- One save model: profile edits no longer write `settings.toml` immediately while field edits
+  waited for Save. Every edit applies at once; **Save changes** (accent outline) writes them
+  all; closing the app still saves
+- Buttons look like buttons: secondary buttons and pickers wear a tinted face instead of the
+  plate reserved for text fields; number fields keep the input look
+- **Manage...** is now **Manage profiles...**
+
+### Fixed
+
+- Elevation reads to the millimetre: the RTCM 1005/1006 base height (`h 1615.876 m (ellipsoidal)`,
+  was `alt 1615.9 m`), the Elevation (ft) / Elevation (m) slots (fixed-width, right-aligned
+  monospace, so the row never shifts), and the elevation graph's cur/min/max/range. The base
+  latitude/longitude go to 8 decimals (~1.1 mm) to match the height beside them
+- The GGA header no longer warns about a missing position on Raw TCP, where none is sent
+
 ## [0.2.1] - 2026-07-23
 
 Field fix: CHC APIS casters connected but never streamed ("Connected - waiting for data",

@@ -1,19 +1,40 @@
 //! Options dialog: display slots, audio alert, log toggles, update checks.
+//!
+//! Edits preview live (a readout slot changes as you pick it) and the
+//! footer decides: Done keeps them, Cancel - or X / Esc - puts back what
+//! the dialog opened with. A stray click outside does nothing, so edits are
+//! never lost by accident. Kept values join the one save model: Save changes
+//! on the main window writes them, as does closing the app.
 
 use crate::logging::LogCmd;
-use crate::settings::{CheckUpdates, DisplayId};
-use crate::ui::App;
+use crate::settings::{AppCfg, CheckUpdates, DisplayCfg, DisplayId};
+use crate::ui::{App, dialog, theme};
+
+/// What the dialog opened with, for Cancel.
+pub struct OptionsSnapshot {
+    app: AppCfg,
+    display: DisplayCfg,
+}
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
     if !app.show_options {
+        app.options_snapshot = None;
         return;
     }
-    let mut open = app.show_options;
-    egui::Window::new("Options")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .show(ctx, |ui| {
+    if app.options_snapshot.is_none() {
+        app.options_snapshot = Some(OptionsSnapshot {
+            app: app.settings.app.clone(),
+            display: app.settings.display.clone(),
+        });
+    }
+    let mut done = false;
+    let mut cancel = false;
+    let dismissed = dialog::show(
+        ctx,
+        "options",
+        "Options",
+        dialog::Dismiss::Explicit,
+        |ui, _frame| {
             egui::Grid::new("options-grid")
                 .num_columns(2)
                 .spacing([8.0, 6.0])
@@ -123,16 +144,42 @@ takes effect on the next connect",
                     ui.label(last);
                     ui.end_row();
                 });
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Settings persist on [Save] and on exit.")
-                    .small()
-                    // Weak resolves to INK_SECONDARY via the theme's
-                    // weak_text_color: readable hint text, AA on the paper.
-                    .weak(),
-            );
-        });
-    app.show_options = open;
+            ui.add_space(10.0);
+            dialog::footer(ui, |ui| {
+                // Right to left: Cancel takes the far right, as in every
+                // other dialog's footer.
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui.add(theme::accent_button("Done")).clicked() {
+                    done = true;
+                }
+            });
+        },
+    );
+    if cancel || dismissed {
+        if let Some(snap) = app.options_snapshot.take() {
+            revert(app, snap);
+        }
+        app.show_options = false;
+    } else if done {
+        app.options_snapshot = None;
+        app.show_options = false;
+    }
+}
+
+/// Put back what the dialog opened with, including the two log toggles'
+/// live effect on the logger thread.
+fn revert(app: &mut App, snap: OptionsSnapshot) {
+    let log = app.hub.log_sender();
+    if app.settings.app.write_event_log != snap.app.write_event_log {
+        let _ = log.send(LogCmd::SetEventLog(snap.app.write_event_log));
+    }
+    if app.settings.app.write_nmea_log != snap.app.write_nmea_log {
+        let _ = log.send(LogCmd::SetNmeaLog(snap.app.write_nmea_log));
+    }
+    app.settings.app = snap.app;
+    app.settings.display = snap.display;
 }
 
 fn display_combo(ui: &mut egui::Ui, id: &str, choice: &mut DisplayId) {

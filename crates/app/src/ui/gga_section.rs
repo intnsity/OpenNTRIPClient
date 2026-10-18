@@ -41,43 +41,43 @@ pub struct ViewState {
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     theme::card(ui.style()).show(ui, |ui| {
-        let open = app.settings.window.gga_open;
-        ui.horizontal(|ui| {
-            if ui
-                .selectable_label(
-                    open,
-                    if open {
-                        "v GGA position reporting"
-                    } else {
-                        "> GGA position reporting"
-                    },
-                )
-                .on_hover_text(
-                    "Whether and how this client sends its position (NMEA GGA) \
-                     up to the caster",
-                )
-                .clicked()
-            {
-                app.settings.window.gga_open = !open;
-            }
-            // Collapsed or open, the current configuration reads on the right:
-            // the whole point of the fold is that GGA state is never hidden.
-            let p = app.settings.active();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(summary(
-                        p.gga_mode,
-                        p.gga_source,
-                        p.manual_lat,
-                        p.manual_lon,
-                    ))
-                    .small()
-                    .weak(),
-                );
-            });
-        });
+        // Collapsed or open, the current configuration reads in the header:
+        // the whole point of the fold is that GGA state is never hidden. The
+        // worker reads this same slot, so "nothing to send" agrees with it.
+        let receiver_ready = app.last_gga.read().is_ok_and(|g| g.is_some());
+        let p = app.settings.active();
+        // Raw TCP has no request to carry a position, so the worker never
+        // sends one there; warning "no position to send" would be noise.
+        let (text, nothing_to_send) = if p.protocol == crate::settings::ProtocolCfg::Tcp {
+            ("not used with Raw TCP".to_string(), false)
+        } else {
+            summary(
+                p.gga_mode,
+                p.gga_source,
+                p.manual_lat,
+                p.manual_lon,
+                receiver_ready,
+            )
+        };
+        let ink = if nothing_to_send {
+            theme::warning()
+        } else {
+            theme::ink_secondary()
+        };
+        theme::disclosure(
+            ui,
+            &mut app.settings.window.gga_open,
+            "GGA position reporting",
+            &text,
+            ink,
+        )
+        .on_hover_text(
+            "Whether and how this client sends its position (NMEA GGA) up to \
+             the caster. Many casters need one - even an approximate manual \
+             point - before they stream.",
+        );
 
-        if open {
+        if app.settings.window.gga_open {
             ui.add_space(2.0);
             body(app, ui);
         }
@@ -162,7 +162,8 @@ fn manual_editor(
         .spacing([8.0, 6.0])
         .show(ui, |ui| {
             ui.label("Latitude");
-            ui.add(
+            theme::number_field(
+                ui,
                 egui::DragValue::new(&mut p.manual_lat)
                     .speed(0.0001)
                     .range(-90.0..=90.0)
@@ -170,7 +171,8 @@ fn manual_editor(
             );
             ui.end_row();
             ui.label("Longitude");
-            ui.add(
+            theme::number_field(
+                ui,
                 egui::DragValue::new(&mut p.manual_lon)
                     .speed(0.0001)
                     .range(-180.0..=180.0)
@@ -291,25 +293,35 @@ fn step_selection(selected: usize, len: usize, down: bool) -> usize {
 }
 
 /// One-line collapsed summary of the profile's GGA configuration, so the
-/// disclosure communicates its state without being opened. "off" says it all
-/// on its own - source and position are moot when nothing is sent. An unset
-/// manual position must not masquerade as a survey mark at 0.00000, 0.00000:
-/// the worker refuses to fabricate from it, and the front page has to agree
-/// with the event log about that.
-fn summary(mode: GgaMode, source: GgaSource, lat: f64, lon: f64) -> String {
+/// disclosure communicates its state without being opened, plus whether GGA
+/// is wanted but there is nothing to send (the caller inks that as a
+/// warning: a caster waiting on a position looks like a dead mount). "off"
+/// says it all on its own - source and position are moot when nothing is
+/// sent. An unset manual position must not masquerade as a survey mark at
+/// 0.00000, 0.00000: the worker refuses to fabricate from it, and the front
+/// page has to agree with the event log about that. `receiver_ready` is
+/// whether the receiver has supplied a GGA to pass through.
+fn summary(
+    mode: GgaMode,
+    source: GgaSource,
+    lat: f64,
+    lon: f64,
+    receiver_ready: bool,
+) -> (String, bool) {
     let mode_txt = match mode {
-        GgaMode::Off => return "off".to_string(),
+        GgaMode::Off => return ("off".to_string(), false),
         GgaMode::WhenRequired => "when required",
         GgaMode::Always => "always",
     };
-    let src = match source {
-        GgaSource::Receiver => "receiver".to_string(),
+    let (src, ready) = match source {
+        GgaSource::Receiver => ("receiver".to_string(), receiver_ready),
         GgaSource::Manual if crate::workers::ntrip::manual_position_set(lat, lon) => {
-            format!("manual {lat:.5}, {lon:.5}")
+            (format!("manual {lat:.5}, {lon:.5}"), true)
         }
-        GgaSource::Manual => "manual - position NOT SET".to_string(),
+        GgaSource::Manual => ("manual".to_string(), false),
     };
-    format!("{mode_txt}, {src}")
+    let tail = if ready { "" } else { " - no position to send" };
+    (format!("{mode_txt}, {src}{tail}"), !ready)
 }
 
 #[cfg(test)]
@@ -374,26 +386,44 @@ mod tests {
     }
 
     /// The collapsed summary reflects mode, source, and - for a manual point -
-    /// the coordinates, so the section's state reads without opening it.
+    /// the coordinates, so the section's state reads without opening it; and
+    /// it flags (for warning ink) a wanted GGA with nothing to send.
     #[test]
     fn summary_reflects_configuration() {
+        let s = |text: &str, warn| (text.to_string(), warn);
         assert_eq!(
-            summary(GgaMode::Off, GgaSource::Manual, 45.0, -122.0),
-            "off"
+            summary(GgaMode::Off, GgaSource::Manual, 45.0, -122.0, false),
+            s("off", false)
+        );
+        // Off sends nothing by choice, not for lack of a position.
+        assert_eq!(
+            summary(GgaMode::Off, GgaSource::Receiver, 0.0, 0.0, false),
+            s("off", false)
         );
         assert_eq!(
-            summary(GgaMode::WhenRequired, GgaSource::Receiver, 0.0, 0.0),
-            "when required, receiver"
+            summary(GgaMode::WhenRequired, GgaSource::Receiver, 0.0, 0.0, true),
+            s("when required, receiver", false)
         );
         assert_eq!(
-            summary(GgaMode::Always, GgaSource::Manual, 45.52021, -122.67419),
-            "always, manual 45.52021, -122.67419"
+            summary(
+                GgaMode::Always,
+                GgaSource::Manual,
+                45.52021,
+                -122.67419,
+                false
+            ),
+            s("always, manual 45.52021, -122.67419", false)
+        );
+        // No receiver GGA to pass through: wanted, nothing to send.
+        assert_eq!(
+            summary(GgaMode::Always, GgaSource::Receiver, 45.0, -122.0, false),
+            s("always, receiver - no position to send", true)
         );
         // The unset (0, 0) default must not read as a real coordinate: the
         // worker will send nothing, and the summary has to say so.
         assert_eq!(
-            summary(GgaMode::WhenRequired, GgaSource::Manual, 0.0, 0.0),
-            "when required, manual - position NOT SET"
+            summary(GgaMode::WhenRequired, GgaSource::Manual, 0.0, 0.0, true),
+            s("when required, manual - no position to send", true)
         );
     }
 

@@ -122,6 +122,18 @@ string_enum! {
 }
 
 string_enum! {
+    /// Appearance: the ButterPaper colorways, ids matching ButterPaper's own
+    /// `data-theme` names. UI-preference class like the window size:
+    /// persisted by the unconditional exit save, ignored by
+    /// [`Settings::persistable_eq`] so switching never lights Save.
+    pub enum Colorway {
+        ButterPaper => "paper",
+        SouthwestNight => "desert",
+        NordicNight => "nordic",
+    } default ButterPaper
+}
+
+string_enum! {
     /// The original client's display-slot identifiers, verbatim - they round
     /// trip through Settings.txt imports and the [display] table - plus two
     /// stream-side deltas (data-age, data-rate) fed by the caster stream
@@ -236,9 +248,7 @@ impl Settings {
             self.active_profile = self.profiles[0].name.clone();
         }
         for p in &mut self.profiles {
-            if !(p.ntrip_version == 1 || p.ntrip_version == 2) {
-                p.ntrip_version = 1;
-            }
+            p.normalize();
         }
         if !(self.serial.data_bits == 7 || self.serial.data_bits == 8) {
             self.serial.data_bits = 8;
@@ -320,6 +330,10 @@ pub struct WindowCfg {
     pub tab: BottomTab,
     /// GGA section disclosure state in the NTRIP block.
     pub gga_open: bool,
+    /// Receiver card's "Port settings" disclosure state.
+    pub serial_open: bool,
+    /// Appearance (the profile strip's colorway switcher).
+    pub colorway: Colorway,
 }
 
 impl Default for WindowCfg {
@@ -328,10 +342,12 @@ impl Default for WindowCfg {
             pos: None,
             // Sized for the One Surface layout: two config columns plus the
             // bottom tab pane at rest. Existing users keep their saved size.
-            size: [920.0, 680.0],
+            size: [980.0, 860.0],
             graph_open: false,
             tab: BottomTab::Events,
             gga_open: false,
+            serial_open: false,
+            colorway: Colorway::ButterPaper,
         }
     }
 }
@@ -437,6 +453,41 @@ impl Default for Profile {
             gga_source: GgaSource::Receiver,
             manual_lat: 0.0,
             manual_lon: 0.0,
+        }
+    }
+}
+
+impl Profile {
+    /// Where a profile points, as the list's second line: "host:port / MOUNT",
+    /// flagged when it uses TLS or raw TCP, so two rows that differ only in
+    /// caster are told apart without opening either.
+    pub fn summary(&self) -> String {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return "no caster set".to_string();
+        }
+        let mut s = format!("{host}:{}", self.port);
+        match self.protocol {
+            ProtocolCfg::Tcp => s.push_str("  raw TCP"),
+            ProtocolCfg::Ntrip => match self.mountpoint.trim() {
+                "" => s.push_str(" / no mountpoint"),
+                m => {
+                    s.push_str(" / ");
+                    s.push_str(m);
+                }
+            },
+        }
+        if self.tls {
+            s.push_str("  TLS");
+        }
+        s
+    }
+
+    /// Repair what a hand-edited file may break in one profile; shared by
+    /// settings.toml loading and profile-file import.
+    pub(crate) fn normalize(&mut self) {
+        if !(self.ntrip_version == 1 || self.ntrip_version == 2) {
+            self.ntrip_version = 1;
         }
     }
 }
@@ -969,9 +1020,10 @@ size = [10.0, 9999.0]
     #[test]
     fn window_defaults_match_one_surface_layout() {
         let w = WindowCfg::default();
-        assert_eq!(w.size, [920.0, 680.0]);
+        assert_eq!(w.size, [980.0, 860.0]);
         assert_eq!(w.tab, BottomTab::Events);
         assert!(!w.gga_open);
+        assert!(!w.serial_open);
         assert!(!w.graph_open);
         assert_eq!(w.pos, None);
     }
@@ -1015,6 +1067,7 @@ size = [10.0, 9999.0]
         churn.window.graph_open = true;
         churn.window.tab = BottomTab::Sourcetable;
         churn.window.gga_open = true;
+        churn.window.serial_open = true;
         churn.state.last_update_check = "2026-07-16".to_string();
         churn.state.serial_connected = true;
         churn.state.ntrip_connected = true;
@@ -1264,5 +1317,25 @@ Serial Should Be Connected=Yes\nNTRIP Should Be Connected=Yes\n",
         assert_eq!(s2, s);
         assert!(log2.is_empty());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn profile_summary_names_where_it_points() {
+        let mut p = Profile {
+            host: " rtk.example.net ".to_string(),
+            port: 2101,
+            mountpoint: "BASE01".to_string(),
+            ..Profile::default()
+        };
+        assert_eq!(p.summary(), "rtk.example.net:2101 / BASE01");
+        p.tls = true;
+        p.port = 443;
+        assert_eq!(p.summary(), "rtk.example.net:443 / BASE01  TLS");
+        p.tls = false;
+        p.mountpoint.clear();
+        assert_eq!(p.summary(), "rtk.example.net:443 / no mountpoint");
+        p.protocol = ProtocolCfg::Tcp;
+        assert_eq!(p.summary(), "rtk.example.net:443  raw TCP");
+        assert_eq!(Profile::default().summary(), "no caster set");
     }
 }

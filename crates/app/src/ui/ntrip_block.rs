@@ -1,15 +1,19 @@
-//! "NTRIP Caster" group: caster address and credentials, the editable
-//! mountpoint combo fed by the cached sourcetable, protocol selectors,
-//! connect/disconnect, status with reconnect attempt counter.
+//! The caster card (setup step 1): caster address and credentials, the
+//! editable mountpoint combo fed by the loaded sourcetable, the protocol,
+//! the one primary action, and status with reconnect attempt counter.
 
-use crate::bus::NtripStatus;
-use crate::settings::{Profile, ProtocolCfg};
+use std::sync::Arc;
+
+use ntrip_core::sourcetable::SourceTable;
+
+use crate::settings::{BottomTab, Profile, ProtocolCfg};
 use crate::ui::{App, theme};
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     theme::card(ui.style()).show(ui, |ui| {
-        ui.set_min_height(150.0);
-        ui.strong("NTRIP Caster");
+        // Cards fill their column so the two steps read as one row.
+        ui.set_width(ui.available_width());
+        theme::section_heading(ui, "1", "Caster", false);
         ui.add_space(2.0);
 
         let busy = app.ntrip_busy();
@@ -28,7 +32,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                 .hint_text("caster.example.com"),
                         );
                         ui.label("Port");
-                        ui.add(egui::DragValue::new(&mut p.port).range(1..=65535).speed(1));
+                        theme::number_field(
+                            ui,
+                            egui::DragValue::new(&mut p.port).range(1..=65535).speed(1),
+                        );
                         tls_checkbox(p, ui);
                     });
                     ui.end_row();
@@ -46,25 +53,32 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                 .desired_width(150.0)
                                 .password(!reveal),
                         );
-                        ui.toggle_value(&mut app.reveal_password, "Show")
-                            .on_hover_text("Reveal the password while held on");
+                        ui.checkbox(&mut app.reveal_password, "show");
                     });
                     ui.end_row();
 
-                    ui.label("Mount");
-                    ui.horizontal(|ui| {
-                        mountpoint_combo(app, ui);
-                    });
+                    ui.label("Mountpoint");
+                    // Raw TCP has no request to name a mount in, and no
+                    // sourcetable to pick one from.
+                    let raw = app.settings.active().protocol == ProtocolCfg::Tcp;
+                    ui.add_enabled_ui(!raw, |ui| {
+                        ui.horizontal(|ui| mountpoint_combo(app, ui));
+                    })
+                    .response
+                    .on_disabled_hover_text("Not used with Raw TCP");
                     ui.end_row();
 
-                    ui.label("Version");
+                    ui.label("Protocol");
                     ui.horizontal(|ui| {
                         let p = app.settings.active_mut();
-                        ui.radio_value(&mut p.ntrip_version, 1u8, "v1");
-                        ui.radio_value(&mut p.ntrip_version, 2u8, "v2");
-                        ui.separator();
-                        ui.radio_value(&mut p.protocol, ProtocolCfg::Ntrip, "NTRIP");
-                        ui.radio_value(&mut p.protocol, ProtocolCfg::Tcp, "raw TCP");
+                        let mut choice = Protocol::of(p);
+                        for c in Protocol::ALL {
+                            // Write back only on a click, so rendering never
+                            // touches the profile (and never lights Save).
+                            if ui.radio_value(&mut choice, c, c.label()).changed() {
+                                choice.apply(p);
+                            }
+                        }
                     });
                     ui.end_row();
 
@@ -84,11 +98,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
         });
+        if busy {
+            ui.label(theme::caption("Fields are locked while connected."));
+        }
 
         ui.add_space(4.0);
+        let host_ok = !app.settings.active().host.trim().is_empty();
         ui.horizontal(|ui| {
-            let label = if busy { "Disconnect" } else { "Connect" };
-            let host_ok = !app.settings.active().host.trim().is_empty();
+            let label = {
+                let p = app.settings.active();
+                primary_label(busy, p.protocol, &p.mountpoint)
+            };
             if ui
                 .add_enabled(busy || host_ok, theme::accent_button(label))
                 .clicked()
@@ -103,22 +123,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     app.connect_ntrip(false);
                 }
             }
+            let raw = app.settings.active().protocol == ProtocolCfg::Tcp;
             if ui
-                .add_enabled(!busy && host_ok, egui::Button::new("Get Sourcetable"))
-                .on_hover_text("Download the caster's stream list")
+                .add_enabled(!raw, egui::Button::new("Browse mounts"))
+                .on_hover_text("Open the Sourcetable tab (filter, sort, pick a mountpoint)")
+                .on_disabled_hover_text("Raw TCP has no sourcetable")
                 .clicked()
             {
-                app.connect_ntrip(true);
-            }
-            if ui
-                .button("Browse...")
-                .on_hover_text("Open the Sourcetable tab (filter, sort, pick a mount)")
-                .clicked()
-            {
-                app.settings.window.tab = crate::settings::BottomTab::Sourcetable;
+                // Land on a populated tab: fetch the list first unless one is
+                // already loaded for this caster or a session holds the line.
+                if !busy && host_ok && loaded_table(app).is_none() {
+                    app.connect_ntrip(true);
+                }
+                app.settings.window.tab = BottomTab::Sourcetable;
             }
         });
-        status_line(app, ui);
+        // A disabled primary must say why in plain sight, not only on hover.
+        if !busy && !host_ok {
+            ui.label(theme::caption("Enter a caster host"));
+        }
     });
 
     // GGA reporting used to hide behind a "Details..." window; One Surface
@@ -127,6 +150,68 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // share a column.
     ui.add_space(4.0);
     super::gga_section::show(app, ui);
+}
+
+/// The one protocol choice the user sees, over the two profile fields the
+/// worker reads. Raw TCP has no NTRIP version, so choosing it leaves
+/// `ntrip_version` alone and switching back restores the user's version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    Ntrip1,
+    Ntrip2,
+    RawTcp,
+}
+
+impl Protocol {
+    const ALL: [Protocol; 3] = [Protocol::Ntrip1, Protocol::Ntrip2, Protocol::RawTcp];
+
+    fn of(p: &Profile) -> Protocol {
+        match (p.protocol, p.ntrip_version) {
+            (ProtocolCfg::Tcp, _) => Protocol::RawTcp,
+            (ProtocolCfg::Ntrip, 2) => Protocol::Ntrip2,
+            (ProtocolCfg::Ntrip, _) => Protocol::Ntrip1,
+        }
+    }
+
+    fn apply(self, p: &mut Profile) {
+        match self {
+            Protocol::Ntrip1 => (p.protocol, p.ntrip_version) = (ProtocolCfg::Ntrip, 1),
+            Protocol::Ntrip2 => (p.protocol, p.ntrip_version) = (ProtocolCfg::Ntrip, 2),
+            Protocol::RawTcp => p.protocol = ProtocolCfg::Tcp,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Protocol::Ntrip1 => "NTRIP 1.0",
+            Protocol::Ntrip2 => "NTRIP 2.0",
+            Protocol::RawTcp => "Raw TCP",
+        }
+    }
+}
+
+/// The primary button names what a click will actually do: an NTRIP request
+/// with no mountpoint IS a sourcetable fetch (see `App::connect_ntrip`).
+fn primary_label(busy: bool, protocol: ProtocolCfg, mountpoint: &str) -> &'static str {
+    if busy {
+        "Disconnect"
+    } else if protocol == ProtocolCfg::Ntrip && mountpoint.trim().is_empty() {
+        "Get sourcetable"
+    } else {
+        "Connect"
+    }
+}
+
+/// The sourcetable in memory, if it belongs to the active profile's caster.
+fn loaded_table(app: &App) -> Option<Arc<SourceTable>> {
+    let p = app.settings.active();
+    let host = p.host.trim();
+    app.state
+        .ntrip
+        .sourcetable
+        .as_ref()
+        .filter(|(h, po, _)| h == host && *po == p.port)
+        .map(|(_, _, t)| t.clone())
 }
 
 /// Live TLS toggle, bound straight to the profile the worker reads. Split
@@ -156,7 +241,7 @@ fn insecure_certs_checkbox(p: &mut Profile, ui: &mut egui::Ui) -> egui::Response
 }
 
 /// The mountpoint control the original made famous: free text AND a dropdown
-/// of the cached sourcetable's streams. Hand-rolled popup so the text stays
+/// of the loaded sourcetable's streams. Hand-rolled popup so the text stays
 /// editable (egui's ComboBox is selection-only).
 fn mountpoint_combo(app: &mut App, ui: &mut egui::Ui) {
     let edit = {
@@ -168,30 +253,29 @@ fn mountpoint_combo(app: &mut App, ui: &mut egui::Ui) {
         )
     };
     let was_open = app.mount_popup_open;
-    if ui
-        .small_button("v")
-        .on_hover_text("Pick from the cached sourcetable")
-        .clicked()
-    {
+    let side = edit.rect.height();
+    let arrow = ui
+        .add(egui::Button::new("").min_size(egui::vec2(side, side)))
+        .on_hover_text("Pick from the sourcetable");
+    // The combo-box glyph, painted in the button's own state ink so it
+    // follows hover and disabled like any label would.
+    let tri = egui::Rect::from_center_size(arrow.rect.center(), egui::vec2(8.0, 5.0));
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![tri.left_top(), tri.right_top(), tri.center_bottom()],
+        ui.style().interact(&arrow).fg_stroke.color,
+        egui::Stroke::NONE,
+    ));
+    if arrow.clicked() {
         app.mount_popup_open = !was_open;
     }
     if !app.mount_popup_open {
         return;
     }
 
-    let (profile_host, profile_port) = {
-        let p = app.settings.active();
-        (p.host.trim().to_string(), p.port)
-    };
-    let table = app
-        .state
-        .ntrip
-        .sourcetable
-        .as_ref()
-        .filter(|(h, po, _)| *h == profile_host && *po == profile_port)
-        .map(|(_, _, t)| t.clone());
-
+    let table = loaded_table(app);
+    let can_fetch = !app.ntrip_busy() && !app.settings.active().host.trim().is_empty();
     let mut picked: Option<String> = None;
+    let mut fetch = false;
     let area = egui::Area::new(egui::Id::new("mount-popup"))
         .order(egui::Order::Foreground)
         .fixed_pos(edit.rect.left_bottom() + egui::vec2(0.0, 2.0))
@@ -219,8 +303,10 @@ fn mountpoint_combo(app: &mut App, ui: &mut egui::Ui) {
                             });
                     }
                     _ => {
-                        ui.label("No sourcetable cached for this caster.");
-                        ui.label("Use [Get Sourcetable] first.");
+                        ui.label("No sourcetable loaded for this caster.");
+                        fetch = ui
+                            .add_enabled(can_fetch, egui::Button::new("Get sourcetable"))
+                            .clicked();
                     }
                 }
             });
@@ -228,67 +314,11 @@ fn mountpoint_combo(app: &mut App, ui: &mut egui::Ui) {
     if let Some(mount) = picked {
         app.settings.active_mut().mountpoint = mount;
         app.mount_popup_open = false;
+    } else if fetch {
+        app.connect_ntrip(true);
+        app.mount_popup_open = false;
     } else if was_open && area.response.clicked_elsewhere() {
         app.mount_popup_open = false;
-    }
-}
-
-fn status_line(app: &App, ui: &mut egui::Ui) {
-    let now = std::time::Instant::now();
-    // The stall clock only matters while Streaming: a green "Streaming"
-    // sitting next to the activity cluster's orange "no data N s" would let
-    // the two adjacent indicators contradict each other for the whole
-    // pre-kick starvation window.
-    let stalled_for = app
-        .state
-        .ntrip
-        .stalled(now)
-        .then(|| app.state.ntrip.rx_age(now).unwrap_or_default());
-    let (text, color) = status_text(
-        &app.state.ntrip.status,
-        stalled_for,
-        app.settings.app.max_reconnect_attempts,
-    );
-    ui.label(egui::RichText::new(text).color(color).small());
-}
-
-/// Status text + ink, pure for testing. `stalled_for` is Some(silence age)
-/// when a live connection has gone quiet past the stall threshold.
-fn status_text(
-    status: &NtripStatus,
-    stalled_for: Option<std::time::Duration>,
-    max: u32,
-) -> (String, egui::Color32) {
-    match status {
-        NtripStatus::Idle => ("Not connected".to_string(), theme::INK_SECONDARY),
-        NtripStatus::Connecting { attempt } => (
-            format!("Connecting (attempt {attempt})..."),
-            theme::INK_PRIMARY,
-        ),
-        NtripStatus::WaitingForData => (
-            "Connected - waiting for data...".to_string(),
-            theme::INK_PRIMARY,
-        ),
-        NtripStatus::Streaming => match stalled_for {
-            // Success green must not outlive the data.
-            Some(age) => (
-                format!("Streaming - no data for {:.0} s", age.as_secs_f32()),
-                theme::WARNING,
-            ),
-            None => ("Streaming".to_string(), theme::SUCCESS),
-        },
-        NtripStatus::ReconnectWait { next_attempt } => (
-            format!("Reconnecting in 10 s (attempt {next_attempt} of {max})"),
-            theme::WARNING,
-        ),
-        NtripStatus::Stopped { summary, failed } => (
-            summary.clone(),
-            if *failed {
-                theme::DANGER
-            } else {
-                theme::INK_SECONDARY
-            },
-        ),
     }
 }
 
@@ -341,28 +371,6 @@ mod tests {
         }]
     }
 
-    /// The status line and the activity cluster must agree during a stall:
-    /// "Streaming" stays green only while data is actually arriving, and
-    /// flips to the warning wording/ink for the silent pre-kick window.
-    #[test]
-    fn status_text_streaming_reflects_stall() {
-        use std::time::Duration;
-        let (text, color) = status_text(&NtripStatus::Streaming, None, 10_000);
-        assert_eq!(text, "Streaming");
-        assert_eq!(color, theme::SUCCESS);
-        let (text, color) = status_text(
-            &NtripStatus::Streaming,
-            Some(Duration::from_secs(10)),
-            10_000,
-        );
-        assert_eq!(text, "Streaming - no data for 10 s");
-        assert_eq!(color, theme::WARNING);
-        // Non-streaming states ignore the stall clock entirely.
-        let (text, color) = status_text(&NtripStatus::Idle, Some(Duration::from_secs(10)), 10_000);
-        assert_eq!(text, "Not connected");
-        assert_eq!(color, theme::INK_SECONDARY);
-    }
-
     /// M3 regression: the TLS checkbox was shipped permanently disabled with
     /// "lands in the next milestone" hover text. It must be a live control
     /// that writes the profile field the worker reads.
@@ -400,5 +408,33 @@ mod tests {
             p.allow_invalid_certs,
             "clicking the override must arm allow_invalid_certs"
         );
+    }
+
+    /// The single Protocol group round-trips onto the two profile fields,
+    /// and Raw TCP keeps the NTRIP version for the trip back.
+    #[test]
+    fn protocol_choice_maps_onto_profile_fields() {
+        let mut p = Profile::default();
+        for c in Protocol::ALL {
+            c.apply(&mut p);
+            assert_eq!(Protocol::of(&p), c);
+        }
+        Protocol::Ntrip2.apply(&mut p);
+        Protocol::RawTcp.apply(&mut p);
+        assert_eq!((p.protocol, p.ntrip_version), (ProtocolCfg::Tcp, 2));
+        Protocol::Ntrip1.apply(&mut p);
+        assert_eq!((p.protocol, p.ntrip_version), (ProtocolCfg::Ntrip, 1));
+    }
+
+    /// The primary label must name what connect_ntrip will do.
+    #[test]
+    fn primary_label_is_state_honest() {
+        assert_eq!(primary_label(true, ProtocolCfg::Ntrip, ""), "Disconnect");
+        assert_eq!(
+            primary_label(false, ProtocolCfg::Ntrip, "  "),
+            "Get sourcetable"
+        );
+        assert_eq!(primary_label(false, ProtocolCfg::Ntrip, "RTCM3"), "Connect");
+        assert_eq!(primary_label(false, ProtocolCfg::Tcp, ""), "Connect");
     }
 }

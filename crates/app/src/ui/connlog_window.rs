@@ -32,8 +32,8 @@ pub struct ViewState {
 /// exchange is the star of this window, not the commentary.
 fn direction_color(d: &Direction) -> Option<egui::Color32> {
     match d {
-        Direction::Tx => Some(theme::ACCENT),
-        Direction::Rx => Some(theme::SUCCESS),
+        Direction::Tx => Some(theme::accent()),
+        Direction::Rx => Some(theme::success()),
         Direction::Note => None,
     }
 }
@@ -300,8 +300,8 @@ mod tests {
     /// default ink (`None`).
     #[test]
     fn direction_colors_are_theme_tokens() {
-        assert_eq!(direction_color(&Direction::Tx), Some(theme::ACCENT));
-        assert_eq!(direction_color(&Direction::Rx), Some(theme::SUCCESS));
+        assert_eq!(direction_color(&Direction::Tx), Some(theme::accent()));
+        assert_eq!(direction_color(&Direction::Rx), Some(theme::success()));
         assert_eq!(direction_color(&Direction::Note), None);
     }
 

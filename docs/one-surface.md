@@ -22,16 +22,22 @@ document records the intent so the layout can be changed without losing the reas
 
 ## The surface, top to bottom
 
+The surface reads **set up, verdict, evidence**. Step 1 (the caster) is read first and holds
+the only solid primary button; step 2 (the receiver) sits beside it, marked optional; the
+session band directly under them answers "is it working?"; everything below is the evidence.
+This is Lefebure's three-button simplicity - pick a stream, connect, see it flow - with the
+power one glance or one click away, never removed.
+
 | Region | Module | What it is |
 |---|---|---|
-| Profile strip | `main_window::profile_strip` | Profile picker, Save, Manage, and the two remaining dialogs (Options, About). |
+| Profile bar | `main_window::profile_strip` | Profile picker (activates on pick; hover shows each caster), the shared Save control, Save as profile, Manage profiles, the appearance switcher, Options, About, and "Disconnect to switch profiles" while connected. |
 | TLS-insecure banner | `main_window` (conditional) | Crimson, undismissable while a live connection skips certificate verification. |
-| Config columns | `serial_block` \| `ntrip_block` | Two side-by-side cards: the serial receiver and the NTRIP caster. |
-| GGA disclosure | `gga_section` | Collapsible, in the NTRIP column. Position reporting - the feature brought to the front page. |
-| Status strip | `status_strip` | Fix readout, two configurable slots, and the stream-activity bar. |
-| Stream summary | `stream_summary` | One clickable line: base identity, position, type/rate, framing health. Opens the Stream tab. |
-| Bottom tab pane | `bottom_tabs` | The four always-present diagnostic surfaces (below). |
-| Graph disclosure | `plot_panel` | Collapsible elevation chart + RX-rate readout. |
+| Setup columns | `ntrip_block` \| `serial_block` | "1 Caster" (with the one state-honest primary: Connect / Get sourcetable / Disconnect) and "2 Receiver (optional)" with its Port settings disclosure. |
+| GGA disclosure | `gga_section` | Collapsible, under the caster. Position reporting - the feature brought to the front page. |
+| Session band | `session_band` | The verdict: state word in its semantic color and a colored left rule, target, session total, rate and activity bar; line 2 is the stream summary (click: Stream tab) or the next step / failure hint (click a position hint: GGA). Fixed height. |
+| From receiver | `status_strip` | Fix banner (live / stale / no receiver) and the two configurable readout slots. |
+| Bottom tab pane | `bottom_tabs` | One card: the four always-present diagnostic surfaces (below). |
+| Graph disclosure | `plot_panel` | Collapsible elevation chart of the receiver. |
 
 ## What folded, and why
 
@@ -51,8 +57,27 @@ of them into the surface:
   search and "use receiver position" simply write those same two floats.
 
 Only genuine settings/informational surfaces stayed as dialogs: **Options**, **About**, and the
-**Profiles Manager**. They are not live session data, and they are rare enough that a window is
-the honest weight for them.
+**Profiles Manager** (with its name prompt, delete confirmation and import/export). They are
+not live session data, and they are rare enough that a dialog is the honest weight for them.
+
+**One dialog pattern** (`ui::dialog`): every dialog is a modal card sized to its content with a
+title row and an X. Dialogs that only show something or apply at once (About, Profiles, the
+delete question) also close on Esc or a click outside; dialogs holding edits the user could
+lose (Options, the name prompt, import/export) close only on purpose - X or Esc as Cancel, never
+a stray click. Questions bring their own action + Cancel footer (Cancel far right); About needs
+no footer. Being modal is what keeps the keyboard simple: while a dialog is up the surface is
+inert.
+
+**Profiles Manager** (`profiles_dialog`) is shaped like any profiles manager: a list of rows
+(name, `host:port / MOUNT`, an ACTIVE badge on the active one) beside a column of verbs, with
+one primary action, **Use profile**, that makes the selection active (Enter and double-click are
+its accelerators; a click only selects). Rename is inline with an explicit commit (Enter/OK;
+Esc, Cancel or any other action abandons; focus loss never commits) and refuses a taken name in
+place via `profiles::check_name`. Delete confirms in an `egui::Modal`. A disabled verb prints its
+reason beneath itself, and a live connection is announced in a warning callout at the top. The
+dialog is built from panels (footer, verb column, list) on a fixed bed, so it never resizes
+itself. No profile is created under a made-up name: New..., Duplicate... and the profile bar's
+Save as profile... share one name prompt with a suggestion drawn from the stream.
 
 ## Laws the pieces obey
 
@@ -63,14 +88,31 @@ the honest weight for them.
 - **Disclosures state themselves while collapsed.** The GGA section shows a one-line summary of
   its configuration ("when required, manual 45.52, -122.67") without being opened, so a glance
   answers "will this send a position" without a click.
-- **Summaries are clickable shortcuts, not dead text.** The stream-summary row opens the Stream
-  detail tab; it exists only while a live session has produced frames, and yields its height
-  back otherwise (no idle placeholder).
+- **One verdict, in one place.** The session band is the only answer to "is it working?" - the
+  caster card no longer carries its own status line and the graph strip no longer repeats the
+  RX rate. Green never outlives the data: a stall reads `NO DATA FOR N s`, and bytes that never
+  frame as RTCM3 read `RECEIVING - NOT RTCM3`.
+- **Summaries are clickable shortcuts, not dead text.** The band's stream summary opens the
+  Stream detail tab; a position hint opens the GGA section. When there is nothing to summarize
+  the line teaches the next step instead of going blank.
 - **Attention comes to the strip, it is not summoned.** When the worker captures an
   unclassified caster response (often an HTML error page where RTCM was expected), a warning
   dot appears on the Conn tab until the tech opens it. See the badge model below.
 - **Per-tab actions stay in their tab.** Copy/Clear belong to the surface they act on; there is
   no strip-level action cluster, because the four tabs' Copy buttons have four different scopes.
+
+## One save model
+
+Every user edit - a front-page field, an Options toggle, a profile add/rename/switch/reorder/
+delete - applies at once in memory. `App.last_saved` is the snapshot of what `settings.toml`
+holds (the loaded settings at boot, replaced on each successful save), and
+`App::has_unsaved_changes` compares against it with `Settings::persistable_eq`. The shared
+`App::save_control` renders the result in both places it appears (profile strip, Profiles
+footer): an accent-outlined **Save changes** while something is unwritten (outlined, not
+solid, so Connect stays the one solid primary), a disabled **Saved** otherwise,
+at a fixed width so the strip does not shift. The exit save still writes everything, so the
+control answers "is this on disk yet", not "will this be lost". Before 0.2.2 profile CRUD wrote
+the file immediately while field edits waited for Save - the two halves of the strip disagreed.
 
 ## Backing data model
 
@@ -83,6 +125,8 @@ never lights the profile-strip Save button.
 | `settings.window.tab: BottomTab` | Active bottom tab (`Events`/`Conn`/`Stream`/`Sourcetable`). |
 | `settings.window.gga_open: bool` | GGA disclosure open state. |
 | `settings.window.graph_open: bool` | Elevation-graph disclosure open state. |
+| `settings.window.serial_open: bool` | Receiver Port settings disclosure open state. |
+| `settings.window.colorway: Colorway` | Appearance (`paper` / `desert` / `nordic`). |
 
 **The Conn attention badge** is a two-counter handshake, so "something unusual arrived" survives
 across stream resets without a live callback:

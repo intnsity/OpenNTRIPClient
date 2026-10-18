@@ -6,8 +6,8 @@
 use crate::ui::{App, theme};
 
 pub fn tab(app: &mut App, ui: &mut egui::Ui) {
+    // The tab already names the page; the row only carries its actions.
     ui.horizontal(|ui| {
-        ui.strong("Event log");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("Clear").clicked() {
                 app.state.events.clear();
@@ -60,9 +60,9 @@ fn line_ink(line: &str) -> egui::Color32 {
     ];
     let lower = line.to_ascii_lowercase();
     if TROUBLE.iter().any(|w| lower.contains(w)) {
-        theme::INK_PRIMARY
+        theme::ink_primary()
     } else {
-        theme::INK_SECONDARY
+        theme::ink_secondary()
     }
 }
 
@@ -78,7 +78,7 @@ mod tests {
             "12:00:03 Serial overrun: 12 blocks dropped",
             "12:00:04 Authorization error (401 Unauthorized)",
         ] {
-            assert_eq!(line_ink(line), theme::INK_PRIMARY, "{line}");
+            assert_eq!(line_ink(line), theme::ink_primary(), "{line}");
         }
     }
 
@@ -90,7 +90,7 @@ mod tests {
             "12:00:06 Sourcetable received (114 streams)",
             "12:00:07 Settings saved",
         ] {
-            assert_eq!(line_ink(line), theme::INK_SECONDARY, "{line}");
+            assert_eq!(line_ink(line), theme::ink_secondary(), "{line}");
         }
     }
 }

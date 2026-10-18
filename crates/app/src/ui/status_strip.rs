@@ -10,8 +10,8 @@ use crate::settings::DisplayId;
 // STALL_AFTER lives in state.rs beside the rx_age/stalled predicate it
 // parameterizes; re-exported here because it is part of this module's
 // classification contract too.
-use crate::state::GnssState;
 pub use crate::state::STALL_AFTER;
+use crate::state::{GnssState, RECEIVER_SILENT_AFTER};
 use crate::ui::{App, theme};
 
 /// Half-life of the activity envelope. A full pulse decays to ~0.18 between
@@ -25,14 +25,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         nmea_seen: app.state.gnss.nmea_seen,
         serial_connected: app.serial.is_some(),
     };
-    // Silence age from the state's stall contract: before the first byte the
-    // status change itself is the reference, so "no data N s" is meaningful
-    // even if nothing ever arrives; None (disconnected) classifies as Idle.
-    let silent = app.state.ntrip.rx_age(now).unwrap_or(Duration::ZERO);
-    let mode = classify_stream(&app.state.ntrip.status, silent, app.rate_kbps);
-    let level = app.activity;
     let stream = StreamView {
-        // Unlike `silent` there is no fallback here: a readout labeled
+        // No time-since-connect fallback here: a readout labeled
         // "Data Age" must not present time-since-connect as data age.
         last_rx_age_s: app
             .state
@@ -49,12 +43,36 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     };
 
     ui.horizontal(|ui| {
-        let (label, color) = fix_label(&app.state.gnss);
-        let banner = ui.label(egui::RichText::new(label).size(24.0).strong().color(color));
+        // Everything up to the activity cluster is the receiver's word, not
+        // the caster's - the most common misreading of this row.
+        ui.label(theme::caption("From receiver"));
+        let banner = fix_banner(&app.state.gnss, receiver.serial_connected, now);
+        let resp = ui.label(
+            egui::RichText::new(banner.text)
+                .size(24.0)
+                .strong()
+                .color(banner.ink),
+        );
+        if let Some(note) = &banner.note {
+            ui.label(theme::caption(note));
+        }
         // The banner is the largest receiver-derived readout on screen: while
         // it has never seen a GGA, say where fix data would come from.
         if !app.state.gnss.has_fix_data {
-            banner.on_hover_text(receiver.hint_text());
+            resp.on_hover_text(receiver.hint_text());
+        } else if banner.note.is_some() {
+            resp.on_hover_text("The receiver has stopped sending NMEA; this was its last fix.");
+        }
+        // Nothing else repaints a quiet app, yet a live fix must go stale the
+        // moment the receiver does, and a stale note's age must keep counting.
+        if app.state.gnss.has_fix_data {
+            let next = match (&banner.note, app.state.gnss.nmea_age(now)) {
+                (None, Some(age)) => {
+                    RECEIVER_SILENT_AFTER.saturating_sub(age) + Duration::from_millis(50)
+                }
+                _ => Duration::from_secs(1),
+            };
+            ui.ctx().request_repaint_after(next);
         }
         ui.add_space(18.0);
         slot(
@@ -74,11 +92,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             &stream,
             receiver,
         );
-        // Stream-activity cluster, right-aligned on the same row: the bar at
-        // the edge, its caption (rate / stall age) immediately to the left.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            activity_cluster(ui, &mode, level);
-        });
     });
 }
 
@@ -142,13 +155,13 @@ pub fn advance_activity(level: f32, dt: Duration, last_total: u64, new_total: u6
 /// never yellow on yellow paper); idle recedes to secondary ink.
 pub fn cluster_caption(mode: &StreamActivity) -> (String, egui::Color32) {
     match mode {
-        StreamActivity::Idle => ("-".to_string(), theme::INK_SECONDARY),
-        StreamActivity::Waiting => ("waiting...".to_string(), theme::INK_SECONDARY),
+        StreamActivity::Idle => ("-".to_string(), theme::ink_secondary()),
+        StreamActivity::Waiting => ("waiting...".to_string(), theme::ink_secondary()),
         StreamActivity::Active { rate_kbps } => {
-            (format!("{rate_kbps:.1} kB/s"), theme::INK_PRIMARY)
+            (format!("{rate_kbps:.1} kB/s"), theme::ink_primary())
         }
         StreamActivity::Stalled { silent_s } => {
-            (format!("no data {silent_s:.0} s"), theme::WARNING)
+            (format!("no data {silent_s:.0} s"), theme::warning())
         }
     }
 }
@@ -160,8 +173,8 @@ pub fn cluster_caption(mode: &StreamActivity) -> (String, egui::Color32) {
 /// invisible exactly when a user scans for where data will appear.
 pub fn bar_stroke_color(mode: &StreamActivity) -> egui::Color32 {
     match mode {
-        StreamActivity::Stalled { .. } => theme::WARNING,
-        _ => theme::INK_MUTED,
+        StreamActivity::Stalled { .. } => theme::warning(),
+        _ => theme::ink_muted(),
     }
 }
 
@@ -180,7 +193,8 @@ pub fn bar_fill_level(mode: &StreamActivity, level: f32) -> f32 {
 
 const BAR_SIZE: egui::Vec2 = egui::vec2(90.0, 10.0);
 
-fn activity_cluster(ui: &mut egui::Ui, mode: &StreamActivity, level: f32) {
+/// The bar plus its caption, right-to-left; rendered by the session band.
+pub fn activity_cluster(ui: &mut egui::Ui, mode: &StreamActivity, level: f32) {
     // Right-to-left row: the bar takes the right edge, caption sits left.
     let bar = activity_bar(ui, mode, level);
     let (caption, color) = cluster_caption(mode);
@@ -202,14 +216,14 @@ fn activity_bar(ui: &mut egui::Ui, mode: &StreamActivity, level: f32) -> egui::R
     let (rect, resp) = ui.allocate_exact_size(BAR_SIZE, egui::Sense::hover());
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        p.rect_filled(rect, 3, theme::PAPER_0);
+        p.rect_filled(rect, 3, theme::paper_0());
         let inner = rect.shrink(1.0);
         let w = inner.width() * bar_fill_level(mode, level);
         if w >= 0.5 {
             p.rect_filled(
                 egui::Rect::from_min_size(inner.min, egui::vec2(w, inner.height())),
                 2,
-                theme::SUCCESS,
+                theme::success(),
             );
         }
         p.rect_stroke(
@@ -226,17 +240,52 @@ fn activity_bar(ui: &mut egui::Ui, mode: &StreamActivity, level: f32) -> egui::R
 // Fix banner
 // ---------------------------------------------------------------------
 
-fn fix_label(g: &GnssState) -> (String, egui::Color32) {
+/// What the fix banner shows: the big word, its ink, and an optional small
+/// note beside it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixBanner {
+    pub text: &'static str,
+    pub ink: egui::Color32,
+    pub note: Option<String>,
+}
+
+/// The banner's state machine. `has_fix_data` latches for the run, so a
+/// receiver unplugged mid-RTK used to leave "RTK Fixed" glowing green; a
+/// fix is live only while the port is open and NMEA keeps arriving.
+/// Otherwise the last quality recedes to secondary ink with a note saying
+/// why. Before any GGA the word names the missing link instead of an
+/// ambiguous "no fix".
+pub fn fix_banner(g: &GnssState, serial_open: bool, now: Instant) -> FixBanner {
+    let talking = g.nmea_age(now).is_some_and(|a| a <= RECEIVER_SILENT_AFTER);
     if !g.has_fix_data {
-        return (
-            "No Fix Data".to_string(),
-            fix_quality_color(false, g.quality),
-        );
+        let text = match (serial_open, talking) {
+            (false, _) => "No receiver",
+            (true, false) => "Waiting for NMEA",
+            (true, true) => "No GGA from receiver",
+        };
+        return FixBanner {
+            text,
+            ink: fix_quality_color(false, g.quality),
+            note: None,
+        };
     }
-    (
-        gnss::nmea::quality_name(g.quality).to_string(),
-        fix_quality_color(true, g.quality),
-    )
+    let text = gnss::nmea::quality_name(g.quality);
+    if serial_open && talking {
+        return FixBanner {
+            text,
+            ink: fix_quality_color(true, g.quality),
+            note: None,
+        };
+    }
+    let note = match g.nmea_age(now) {
+        Some(age) if !serial_open => format!("(last seen {})", super::text::age_label(age)),
+        _ => "(receiver silent)".to_string(),
+    };
+    FixBanner {
+        text,
+        ink: theme::ink_secondary(),
+        note: Some(note),
+    }
 }
 
 /// Butter Paper fix-quality semantics. The original's red/yellow/orange/
@@ -251,14 +300,14 @@ fn fix_label(g: &GnssState) -> (String, egui::Color32) {
 /// renders large. Muted ink is reserved for disabled controls.
 pub fn fix_quality_color(has_fix_data: bool, quality: u8) -> egui::Color32 {
     if !has_fix_data {
-        return theme::INK_SECONDARY;
+        return theme::ink_secondary();
     }
     match quality {
-        0 => theme::DANGER,              // Invalid
-        4 => theme::SUCCESS,             // RTK Fixed
-        5 => theme::WARNING,             // RTK Float
-        1 | 2 | 9 => theme::INK_PRIMARY, // GPS / DGPS / WAAS
-        _ => theme::INK_SECONDARY,       // PPS, Estimated, Manual, Simulation
+        0 => theme::danger(),              // Invalid
+        4 => theme::success(),             // RTK Fixed
+        5 => theme::warning(),             // RTK Float
+        1 | 2 | 9 => theme::ink_primary(), // GPS / DGPS / WAAS
+        _ => theme::ink_secondary(),       // PPS, Estimated, Manual, Simulation
     }
 }
 
@@ -333,6 +382,9 @@ pub struct StreamView {
     pub rate_kbps: Option<f64>,
 }
 
+/// Width of a readout slot: the picker and the value bed beneath it share it.
+const SLOT_WIDTH: f32 = 150.0;
+
 fn slot(
     ui: &mut egui::Ui,
     id: &str,
@@ -343,7 +395,7 @@ fn slot(
 ) {
     ui.vertical(|ui| {
         egui::ComboBox::from_id_salt(id)
-            .width(150.0)
+            .width(SLOT_WIDTH)
             .selected_text(choice.label())
             .show_ui(ui, |ui| {
                 for d in DisplayId::ALL {
@@ -352,27 +404,43 @@ fn slot(
             });
         let value = slot_value(*choice, g, stream);
         let hint = slot_hint(*choice, &value, receiver);
-        let resp = ui.label(egui::RichText::new(value).size(20.0).strong());
-        match hint {
-            SlotHint::None => {}
-            SlotHint::NeedsReceiver => {
-                ui.label(
-                    egui::RichText::new("needs receiver")
-                        .small()
-                        .color(theme::INK_SECONDARY),
-                );
-                resp.on_hover_text(receiver.hint_text());
-            }
-            SlotHint::WaitingForNmea => {
-                ui.label(
-                    egui::RichText::new("waiting for NMEA")
-                        .small()
-                        .color(theme::INK_SECONDARY),
-                );
-                resp.on_hover_text(receiver.hint_text());
-            }
+        // The hint takes the value's own place, so it can only be read as
+        // this slot's - a caption under it read as belonging to a neighbour.
+        let text = match hint {
+            SlotHint::None => egui::RichText::new(value).size(20.0).strong().monospace(),
+            SlotHint::NeedsReceiver => hint_text("needs receiver"),
+            SlotHint::WaitingForNmea => hint_text("waiting for NMEA"),
+        };
+        let resp = value_bed(ui, text);
+        if hint != SlotHint::None {
+            resp.on_hover_text(receiver.hint_text());
         }
     });
+}
+
+/// The live value in a fixed-width, right-aligned monospace bed. A support
+/// tech watches this strip while values tick at 1-10 Hz: in a proportional,
+/// left-aligned label "1615.876 ft" -> "1615.880 ft" changes width and shifts
+/// every neighbour on the row. Monospace digits right-aligned in a bed as
+/// wide as the picker keep the decimal point still and the row from
+/// re-flowing (the 20 pt Plex Mono advance fits 12 characters - "29031.700 ft"
+/// at Everest - inside SLOT_WIDTH).
+fn hint_text(t: &str) -> egui::RichText {
+    egui::RichText::new(t).color(theme::ink_secondary())
+}
+
+fn value_bed(ui: &mut egui::Ui, text: egui::RichText) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        egui::vec2(SLOT_WIDTH, 0.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            // One 20 pt line tall either way, so a hint becoming a value
+            // never moves the row.
+            ui.set_min_size(egui::vec2(SLOT_WIDTH, 26.0));
+            ui.label(text)
+        },
+    )
+    .inner
 }
 
 /// Live value for a display id; "-" while its source (the receiver, or the
@@ -384,8 +452,11 @@ pub fn slot_value(id: DisplayId, g: &GnssState, s: &StreamView) -> String {
         DisplayId::Hdop => g.hdop.map(|v| format!("{v:.1}")),
         DisplayId::Vdop => g.vdop.map(|v| format!("{v:.1}")),
         DisplayId::Pdop => g.pdop.map(|v| format!("{v:.1}")),
-        DisplayId::ElevationFeet => g.alt_m.map(|m| format!("{:.1} ft", m_to_ft(m))),
-        DisplayId::ElevationMeters => g.alt_m.map(|m| format!("{m:.1} m")),
+        // Millimetre (thousandth-of-a-foot) resolution for survey work. f32
+        // keeps ~7 significant digits, so a GGA height like 1615.876 m
+        // survives parse and print intact (pinned by a test).
+        DisplayId::ElevationFeet => g.alt_m.map(|m| format!("{:.3} ft", m_to_ft(m))),
+        DisplayId::ElevationMeters => g.alt_m.map(|m| format!("{m:.3} m")),
         DisplayId::SpeedMph => g.speed_knots.map(|k| format!("{:.1} mph", knots_to_mph(k))),
         DisplayId::SpeedMphSmoothed => g.mph_smooth.get().map(|v| format!("{v:.1} mph")),
         DisplayId::SpeedKmh => g
@@ -407,23 +478,65 @@ mod tests {
     /// The parity-critical banner colors, pinned exactly: RTK Fixed is
     /// emerald, RTK Float signal orange, Invalid crimson, plain GPS/DGPS
     /// ink - and the placeholder before any GGA recedes to secondary ink
-    /// (never muted: "No Fix Data" is a readout the user must be able to
+    /// (never muted: "No receiver" is a readout the user must be able to
     /// read, and secondary is the lightest AA-clearing ink) regardless of
     /// the stale quality byte.
     #[test]
     fn fix_quality_semantics() {
-        assert_eq!(fix_quality_color(true, 4), theme::SUCCESS); // RTK Fixed
-        assert_eq!(fix_quality_color(true, 5), theme::WARNING); // RTK Float
-        assert_eq!(fix_quality_color(true, 0), theme::DANGER); // Invalid
+        assert_eq!(fix_quality_color(true, 4), theme::success()); // RTK Fixed
+        assert_eq!(fix_quality_color(true, 5), theme::warning()); // RTK Float
+        assert_eq!(fix_quality_color(true, 0), theme::danger()); // Invalid
         for gps_like in [1, 2, 9] {
-            assert_eq!(fix_quality_color(true, gps_like), theme::INK_PRIMARY);
+            assert_eq!(fix_quality_color(true, gps_like), theme::ink_primary());
         }
         for exotic in [3, 6, 7, 8, 42] {
-            assert_eq!(fix_quality_color(true, exotic), theme::INK_SECONDARY);
+            assert_eq!(fix_quality_color(true, exotic), theme::ink_secondary());
         }
         // No GGA yet: readable placeholder even if quality still says fixed.
-        assert_eq!(fix_quality_color(false, 4), theme::INK_SECONDARY);
-        assert_eq!(fix_quality_color(false, 0), theme::INK_SECONDARY);
+        assert_eq!(fix_quality_color(false, 4), theme::ink_secondary());
+        assert_eq!(fix_quality_color(false, 0), theme::ink_secondary());
+    }
+
+    /// The banner state machine: the missing link named before any GGA, a
+    /// live fix in its semantic ink, and a latched fix receding to secondary
+    /// ink with a note once the port closes or the receiver goes quiet.
+    #[test]
+    fn fix_banner_states() {
+        let t0 = Instant::now();
+        let mut g = crate::state::AppState::new(t0).gnss;
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert_eq!(fix_banner(&g, false, t0).text, "No receiver");
+        assert_eq!(fix_banner(&g, true, t0).text, "Waiting for NMEA");
+        g.nmea_seen = true;
+        g.last_nmea = Some(t0);
+        let no_gga = fix_banner(&g, true, at(1));
+        assert_eq!(no_gga.text, "No GGA from receiver");
+        assert_eq!(no_gga.ink, theme::ink_secondary());
+        // A receiver that went quiet before any GGA is waited on again.
+        assert_eq!(fix_banner(&g, true, at(10)).text, "Waiting for NMEA");
+
+        g.has_fix_data = true;
+        g.quality = 4;
+        let live = fix_banner(&g, true, at(3));
+        assert_eq!(
+            live,
+            FixBanner {
+                text: "RTK Fixed",
+                ink: theme::success(),
+                note: None,
+            }
+        );
+        let silent = fix_banner(&g, true, at(4));
+        assert_eq!(silent.text, "RTK Fixed");
+        assert_eq!(silent.ink, theme::ink_secondary(), "never green when stale");
+        assert_eq!(silent.note.as_deref(), Some("(receiver silent)"));
+        let unplugged = fix_banner(&g, false, at(1));
+        assert_eq!(unplugged.ink, theme::ink_secondary());
+        assert_eq!(unplugged.note.as_deref(), Some("(last seen just now)"));
+        assert_eq!(
+            fix_banner(&g, false, at(150)).note.as_deref(),
+            Some("(last seen 2 min ago)")
+        );
     }
 
     /// The envelope's exact rhythm: a burst snaps to 1.0 (caller side), one
@@ -559,26 +672,29 @@ mod tests {
         let stalled = StreamActivity::Stalled { silent_s: 5.0 };
         // Opaque muted ink, not a translucent hairline: the empty idle well
         // must stay discoverable (3:1+ non-text boundary on every paper).
-        assert_eq!(bar_stroke_color(&active), theme::INK_MUTED);
-        assert_eq!(bar_stroke_color(&StreamActivity::Idle), theme::INK_MUTED);
-        assert_eq!(bar_stroke_color(&StreamActivity::Waiting), theme::INK_MUTED);
-        assert_eq!(bar_stroke_color(&stalled), theme::WARNING);
+        assert_eq!(bar_stroke_color(&active), theme::ink_muted());
+        assert_eq!(bar_stroke_color(&StreamActivity::Idle), theme::ink_muted());
+        assert_eq!(
+            bar_stroke_color(&StreamActivity::Waiting),
+            theme::ink_muted()
+        );
+        assert_eq!(bar_stroke_color(&stalled), theme::warning());
 
         assert_eq!(
             cluster_caption(&active),
-            ("0.7 kB/s".to_string(), theme::INK_PRIMARY)
+            ("0.7 kB/s".to_string(), theme::ink_primary())
         );
         assert_eq!(
             cluster_caption(&stalled),
-            ("no data 5 s".to_string(), theme::WARNING)
+            ("no data 5 s".to_string(), theme::warning())
         );
         assert_eq!(
             cluster_caption(&StreamActivity::Idle),
-            ("-".to_string(), theme::INK_SECONDARY)
+            ("-".to_string(), theme::ink_secondary())
         );
         assert_eq!(
             cluster_caption(&StreamActivity::Waiting),
-            ("waiting...".to_string(), theme::INK_SECONDARY)
+            ("waiting...".to_string(), theme::ink_secondary())
         );
 
         assert_eq!(bar_fill_level(&StreamActivity::Idle, 0.9), 0.0);
@@ -656,5 +772,47 @@ mod tests {
         assert_eq!(slot_value(DisplayId::DataRate, &g, &idle), "-");
         // Receiver-derived ids ignore the stream view entirely.
         assert_eq!(slot_value(DisplayId::Age, &g, &live), "-");
+    }
+
+    /// Elevation reads to three decimals in both units - the user's own
+    /// example, 1615.876 m - and stays an honest dash before any GGA.
+    #[test]
+    fn elevation_slots_read_three_decimals() {
+        let idle = StreamView {
+            last_rx_age_s: None,
+            rate_kbps: None,
+        };
+        let mut g = crate::state::AppState::new(Instant::now()).gnss;
+        assert_eq!(slot_value(DisplayId::ElevationMeters, &g, &idle), "-");
+        assert_eq!(slot_value(DisplayId::ElevationFeet, &g, &idle), "-");
+        g.alt_m = Some(1615.876);
+        assert_eq!(
+            slot_value(DisplayId::ElevationMeters, &g, &idle),
+            "1615.876 m"
+        );
+        // 1615.876 m / 0.3048 = 5301.430 ft.
+        assert_eq!(
+            slot_value(DisplayId::ElevationFeet, &g, &idle),
+            "5301.430 ft"
+        );
+        // End to end from the receiver's sentence: the f32 parse keeps the
+        // third decimal (no type widening needed for a display change).
+        let body = "GPGGA,123519,3500.000,N,10600.000,W,4,12,0.8,1615.876,M,-21.2,M,1.0,0000";
+        let ck = body.bytes().fold(0u8, |a, b| a ^ b);
+        let Ok(gnss::nmea::Sentence::Gga(gga)) = gnss::nmea::parse(&format!("${body}*{ck:02X}"))
+        else {
+            panic!("expected a GGA");
+        };
+        g.alt_m = gga.alt_m;
+        assert_eq!(
+            slot_value(DisplayId::ElevationMeters, &g, &idle),
+            "1615.876 m"
+        );
+        // Below the ellipsoid/geoid is a real survey case, not an error.
+        g.alt_m = Some(-12.5);
+        assert_eq!(
+            slot_value(DisplayId::ElevationMeters, &g, &idle),
+            "-12.500 m"
+        );
     }
 }

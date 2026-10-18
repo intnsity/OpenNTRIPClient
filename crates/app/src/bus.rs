@@ -36,6 +36,35 @@ pub enum NtripStatus {
     },
 }
 
+/// The worker's verdict that a caster may be withholding corrections for
+/// want of a position. Users rarely know a caster can demand their location
+/// (even a mock one) or serve only nearby users; this names the remedy in
+/// one sentence instead of leaving a silent or refused stream unexplained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionTrouble {
+    /// Accepted but starved or dropped while no GGA went out.
+    Starved,
+    /// Refused outright (not an auth failure) with no position to offer.
+    Refused,
+}
+
+impl PositionTrouble {
+    /// One sentence each; the remedy covers both "GGA off" and "GGA on but
+    /// nothing to send", so it never has to know which.
+    pub fn hint(self) -> &'static str {
+        match self {
+            PositionTrouble::Starved => {
+                "The caster may want your position: turn on GGA (a nearby manual point \
+                 is fine) and reconnect."
+            }
+            PositionTrouble::Refused => {
+                "The caster may only serve users near it: send a manual GGA position \
+                 near the base and reconnect."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SerialStatus {
     Connected { port: String, detail: String },
@@ -65,6 +94,9 @@ pub enum AppEvent {
     /// reconnect decisions) for the Connection Log window's ring.
     ConnLine(String),
     Ntrip(NtripStatus),
+    /// Plain-words summary of the connection that just ended (not a user
+    /// cancel), posted before the reconnect decision.
+    LastClose(String),
     /// Cumulative correction bytes received this app run.
     RxBytes {
         total: u64,
@@ -82,6 +114,9 @@ pub enum AppEvent {
     UnknownResponse {
         raw: Vec<u8>,
     },
+    /// Position verdict for the current connection attempt; None withdraws
+    /// it (a GGA went out after all).
+    PositionTrouble(Option<PositionTrouble>),
     Nmea(gnss::nmea::Sentence),
     Serial(SerialStatus),
     /// Cumulative serial-overrun count (corrections dropped, oldest first).

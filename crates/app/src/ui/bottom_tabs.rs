@@ -40,43 +40,48 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // Computed before the visible-Conn ack below, so a fresh capture shows
     // its dot the same frame it lands (unless the Conn tab is already open).
     let unseen_unknown = app.state.ntrip.unknown_response_gen > app.conn_unknown_ack;
-    ui.horizontal(|ui| {
-        for (tab, label, hover) in TABS {
-            let active = app.settings.window.tab == tab;
-            let attention = tab == BottomTab::Conn && unseen_unknown && !active;
-            let hover = if attention {
-                "An unrecognized caster response was captured - open to inspect it"
-            } else {
-                hover
-            };
-            let resp = ui
-                .add(egui::Button::selectable(active, label))
-                .on_hover_text(hover);
-            if attention {
-                // A small warning dot on the tab's top-right corner: enough to
-                // pull the eye, gone the moment the tab is opened.
-                ui.painter().circle_filled(
-                    resp.rect.right_top() + egui::vec2(-3.0, 3.0),
-                    3.0,
-                    theme::WARNING,
-                );
+    // One card holds the strip and its page, so the four tabs read as tabs
+    // and the evidence reads as one region, distinct from the setup above.
+    theme::card(ui.style()).show(ui, |ui| {
+        ui.set_min_size(ui.available_size());
+        ui.horizontal(|ui| {
+            for (tab, label, hover) in TABS {
+                let active = app.settings.window.tab == tab;
+                let attention = tab == BottomTab::Conn && unseen_unknown && !active;
+                let hover = if attention {
+                    "An unrecognized caster response was captured - open to inspect it"
+                } else {
+                    hover
+                };
+                let resp = ui
+                    .add(egui::Button::selectable(active, label))
+                    .on_hover_text(hover);
+                if attention {
+                    // A small warning dot on the tab's top-right corner: enough to
+                    // pull the eye, gone the moment the tab is opened.
+                    ui.painter().circle_filled(
+                        resp.rect.right_top() + egui::vec2(-3.0, 3.0),
+                        3.0,
+                        theme::warning(),
+                    );
+                }
+                if resp.clicked() {
+                    app.settings.window.tab = tab;
+                }
             }
-            if resp.clicked() {
-                app.settings.window.tab = tab;
-            }
+        });
+        ui.separator();
+        // Seeing the Conn tab IS the acknowledgement: stamp the current
+        // unknown-response generation on every frame it is visible, so the
+        // badge predicate (builder-owned) has nothing left to point at.
+        if app.settings.window.tab == BottomTab::Conn {
+            app.conn_unknown_ack = app.state.ntrip.unknown_response_gen;
+        }
+        match app.settings.window.tab {
+            BottomTab::Events => super::log_pane::tab(app, ui),
+            BottomTab::Conn => super::connlog_window::tab(app, ui),
+            BottomTab::Stream => super::rtcm_inspector::tab(app, ui),
+            BottomTab::Sourcetable => super::sourcetable_browser::tab(app, ui),
         }
     });
-    ui.add_space(2.0);
-    // Seeing the Conn tab IS the acknowledgement: stamp the current
-    // unknown-response generation on every frame it is visible, so the
-    // badge predicate (builder-owned) has nothing left to point at.
-    if app.settings.window.tab == BottomTab::Conn {
-        app.conn_unknown_ack = app.state.ntrip.unknown_response_gen;
-    }
-    match app.settings.window.tab {
-        BottomTab::Events => super::log_pane::tab(app, ui),
-        BottomTab::Conn => super::connlog_window::tab(app, ui),
-        BottomTab::Stream => super::rtcm_inspector::tab(app, ui),
-        BottomTab::Sourcetable => super::sourcetable_browser::tab(app, ui),
-    }
 }

@@ -1,26 +1,24 @@
-//! One-line clickable stream summary between the status strip and the bottom
-//! tab pane. The status strip answers "is data flowing"; this row answers
-//! "what is in the data" - the base station's identity and position, how many
-//! message types at what byte rate, and whether the RTCM framing is clean -
-//! and a click drops the user into the Stream detail tab for the full decode.
+//! The session band's second line while frames flow: what is in the data.
+//! The base station's identity and position, how many message types at what
+//! byte rate, and whether the RTCM framing is clean; a click drops the user
+//! into the Stream detail tab for the full decode.
 //!
-//! It exists only while a live session has actually produced frames: before
-//! the first frame the status strip's activity cluster already narrates the
-//! connect/wait, and once the worker is gone the final numbers live on in the
-//! Stream tab. So the row appears when there is something to summarize and
-//! silently yields its height back otherwise - no idle placeholder.
+//! It renders only while a live session has actually produced frames;
+//! otherwise the band shows its next-step line in the same slot.
 
 use gnss::rtcm::decode::Decoded;
 
 use crate::settings::BottomTab;
 use crate::ui::{App, theme};
 
-pub fn show(app: &mut App, ui: &mut egui::Ui) {
+/// Render the summary line if there is one; false leaves the slot to the
+/// caller.
+pub fn line(app: &mut App, ui: &mut egui::Ui) -> bool {
     // Only while a worker is live AND frames have arrived: `reset_stream_stats`
     // clears `rtcm` at each connect, and `ntrip_busy` falls at stop, so this
     // predicate is precisely "a session is streaming content right now".
     if !app.ntrip_busy() || app.state.ntrip.rtcm.is_empty() {
-        return;
+        return false;
     }
 
     let n = &app.state.ntrip;
@@ -51,7 +49,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         0.0,
         egui::TextFormat {
             font_id: font.clone(),
-            color: theme::INK_SECONDARY,
+            color: theme::ink_secondary(),
             ..Default::default()
         },
     );
@@ -61,8 +59,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         egui::TextFormat {
             font_id: font,
             color: match health {
-                Health::Clean => theme::SUCCESS,
-                Health::Issues => theme::WARNING,
+                Health::Clean => theme::success(),
+                Health::Issues => theme::warning(),
             },
             ..Default::default()
         },
@@ -77,7 +75,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if resp.clicked() {
         app.settings.window.tab = BottomTab::Stream;
     }
-    ui.add_space(4.0);
+    true
 }
 
 /// Whether the RTCM framing looks clean. Any CRC failure or stray byte is a
@@ -103,8 +101,8 @@ fn summary_line(
     garbage_bytes: u64,
 ) -> (String, String, Health) {
     let mut head = match base {
-        Some((id, Some((lat, lon)))) => format!("base {id}  {lat:.5}, {lon:.5}"),
-        Some((id, None)) => format!("base {id}  (position not set)"),
+        Some((id, Some((lat, lon)))) => format!("station {id}  {lat:.5}, {lon:.5}"),
+        Some((id, None)) => format!("station {id}  (position not set)"),
         None => "no base station yet".to_string(),
     };
     head.push_str(&format!(
@@ -138,7 +136,7 @@ mod tests {
         );
         assert_eq!(
             head,
-            "base 1234  45.52021, -122.67419   -   8 types, 4210 frames   1.2 kB/s"
+            "station 1234  45.52021, -122.67419   -   8 types, 4210 frames   1.2 kB/s"
         );
         assert_eq!(chip, "framing clean");
         assert_eq!(health, Health::Clean);
@@ -147,7 +145,7 @@ mod tests {
     #[test]
     fn base_without_surveyed_position() {
         let (head, _, _) = summary_line(Some((7, None)), 3, 90, 0.4, 0, 0);
-        assert!(head.starts_with("base 7  (position not set)"), "{head}");
+        assert!(head.starts_with("station 7  (position not set)"), "{head}");
     }
 
     #[test]

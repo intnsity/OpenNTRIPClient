@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ntrip_core::{NtripVersion, Transport};
-use open_ntrip_client::bus::{AppEvent, Hub, Repaint};
+use open_ntrip_client::bus::{AppEvent, Hub, PositionTrouble, Repaint};
 use open_ntrip_client::logging::{CaptureTarget, Logger};
 use open_ntrip_client::settings::{GgaMode, GgaSource};
 use open_ntrip_client::workers::CorrQueue;
@@ -221,6 +221,7 @@ ENDSOURCETABLE\r\n";
         Arc::new(CorrQueue::new(256)),
         Arc::new(RwLock::new(None)),
     );
+    assert!(handle.is_table_request(), "the UI switches tabs off this");
     let (events, stopped) = collect_until_stopped(&rx, Instant::now() + Duration::from_secs(8));
     assert!(handle.join(Duration::from_secs(2)));
     served.handle.join().unwrap();
@@ -351,6 +352,43 @@ fn bad_mountpoint_reports_plainly_and_still_surfaces_table() {
             |e| matches!(e, AppEvent::SourcetableReady { table, .. } if table.strs.len() == 1)
         ),
         "table from MountpointNotFound must be posted"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SNIP-style casters (rtk2go) answer rejected credentials with the
+/// sourcetable. When that table lists the requested mount, the mount is not
+/// the problem and the summary must point at User and Password instead.
+#[test]
+fn sourcetable_answer_listing_the_mount_points_at_credentials() {
+    let table =
+        b"STR;REAL1;City;RTCM 3.2;;2;GPS;;DEU;50.0;8.6;0;1;Gen;none;B;N;520\r\nENDSOURCETABLE\r\n";
+    let mut resp = b"SOURCETABLE 200 OK\r\n".to_vec();
+    resp.extend_from_slice(table);
+    let served = serve(resp, Duration::ZERO);
+    let (hub, rx, logger, dir) = stack("listedmount");
+
+    let handle = ntrip::spawn(
+        job(served.port, "REAL1"),
+        hub,
+        Arc::new(CorrQueue::new(256)),
+        Arc::new(RwLock::new(None)),
+    );
+    assert!(
+        !handle.is_table_request(),
+        "a mount request is not a table fetch"
+    );
+    let (_, stopped) = collect_until_stopped(&rx, Instant::now() + Duration::from_secs(8));
+    assert!(handle.join(Duration::from_secs(2)));
+    served.handle.join().unwrap();
+    logger.shutdown();
+
+    let (summary, failed) = stopped.expect("worker must stop");
+    assert!(failed);
+    assert_eq!(
+        summary,
+        "The caster answered with its sourcetable, not the stream. \
+         'REAL1' is listed, so check User and Password."
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -681,6 +719,14 @@ fn raw_tcp_streams_without_request_or_gga_and_posts_rtcm_stats() {
     assert!(
         conn.iter().all(|l| !l.contains("> ")),
         "no protocol TX lines in raw mode: {conn:?}"
+    );
+    let connected = format!(
+        "TCP connected 127.0.0.1:{} - raw, no NTRIP handshake",
+        served.port
+    );
+    assert!(
+        conn.iter().any(|l| l.ends_with(&connected)),
+        "raw TCP must still leave a connection-log line: {conn:?}"
     );
     stopped.expect("worker must stop");
     let _ = std::fs::remove_dir_all(&dir);
@@ -1310,8 +1356,15 @@ fn remote_close_logs_duration_bytes_and_reconnect_decision() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("Received 10 kB (stream healthy)")),
-        "early milestone missing: {lines:?}"
+            .any(|l| l.contains("Received 10 kB - no RTCM3 frames yet")),
+        "0xAA filler frames nothing, so it must not read as healthy: {lines:?}"
+    );
+    // The close summary reaches the UI state ahead of any reconnect wait.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AppEvent::LastClose(s) if s == "Connection closed by the caster")),
+        "LastClose must carry the close summary"
     );
     let close = lines
         .iter()
@@ -1461,4 +1514,98 @@ fn selftest_exit_codes_usage_and_auth_failure() {
     .collect();
     assert_eq!(open_ntrip_client::selftest::run(&args), 1);
     served.handle.join().unwrap();
+}
+
+fn position_verdicts(events: &[AppEvent]) -> Vec<Option<PositionTrouble>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AppEvent::PositionTrouble(t) => Some(*t),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The silent-mount case users cannot diagnose: the caster accepts, then
+/// holds the stream because no position arrives. With GGA off the worker
+/// says so while the connection is still open - long before the 30 s
+/// silence timeout - and logs the remedy once, not per verdict.
+#[test]
+fn accepted_but_silent_without_gga_is_called_starvation_live() {
+    let served = serve(
+        b"ICY 200 OK\r\n".to_vec(),
+        ntrip::STARVE_HINT_AFTER + Duration::from_millis(1500),
+    );
+    let (hub, rx, logger, dir) = stack("starve");
+    let handle = ntrip::spawn(
+        job(served.port, "VRS1"), // GGA off
+        hub,
+        Arc::new(CorrQueue::new(256)),
+        Arc::new(RwLock::new(None)),
+    );
+    let (events, stopped) = collect_until_stopped(&rx, Instant::now() + Duration::from_secs(15));
+    assert!(handle.join(Duration::from_secs(2)));
+    served.handle.join().unwrap();
+    logger.shutdown();
+
+    let verdicts = position_verdicts(&events);
+    assert_eq!(
+        verdicts.first(),
+        Some(&Some(PositionTrouble::Starved)),
+        "{verdicts:?}"
+    );
+    // The live verdict precedes the close: it is what the user sees while
+    // the caster is still holding the connection.
+    let live = events
+        .iter()
+        .position(|e| matches!(e, AppEvent::PositionTrouble(Some(_))))
+        .unwrap();
+    let closed = events
+        .iter()
+        .position(|e| matches!(e, AppEvent::EventLine(l) if l.contains("Connection closed")))
+        .unwrap_or_else(|| panic!("{:?}", event_lines(&events)));
+    assert!(live < closed, "verdict must come while still connected");
+    let hint = PositionTrouble::Starved.hint();
+    let logged = event_lines(&events)
+        .iter()
+        .filter(|l| l.ends_with(hint))
+        .count();
+    assert_eq!(logged, 1, "remedy logged exactly once per run");
+    stopped.expect("worker must stop");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A non-auth refusal with no position on offer may be a geofence; with a
+/// manual position ready it is not the GGA's fault and gets no verdict.
+#[test]
+fn refusal_without_position_suggests_a_nearby_point() {
+    for (ready, expect) in [(false, Some(PositionTrouble::Refused)), (true, None)] {
+        let served = serve(b"HTTP/1.1 403 Forbidden\r\n\r\n".to_vec(), Duration::ZERO);
+        let (hub, rx, logger, dir) = stack(if ready { "refused-ready" } else { "refused" });
+        let mut j = job(served.port, "VRS1");
+        if ready {
+            j.gga_mode = GgaMode::Always;
+            j.manual_lat = 45.52;
+            j.manual_lon = -122.67;
+        }
+        let handle = ntrip::spawn(
+            j,
+            hub,
+            Arc::new(CorrQueue::new(256)),
+            Arc::new(RwLock::new(None)),
+        );
+        let (events, stopped) = collect_until_stopped(&rx, Instant::now() + Duration::from_secs(8));
+        assert!(handle.join(Duration::from_secs(2)));
+        served.handle.join().unwrap();
+        logger.shutdown();
+
+        let verdicts = position_verdicts(&events);
+        assert_eq!(verdicts.first().copied().flatten(), expect, "{verdicts:?}");
+        let logged = event_lines(&events)
+            .iter()
+            .any(|l| l.ends_with(PositionTrouble::Refused.hint()));
+        assert_eq!(logged, expect.is_some());
+        stopped.expect("worker must stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

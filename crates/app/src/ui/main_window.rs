@@ -22,6 +22,13 @@ use crate::{RELEASES_URL, paths, settings, user_agent};
 pub struct App {
     pub base: PathBuf,
     pub settings: Settings,
+    /// What settings.toml holds as far as this run knows: the loaded
+    /// settings at boot, replaced after every successful save. The single
+    /// save model hangs off it - every user edit (front-page field, Options
+    /// toggle, profile add/rename/switch/delete) applies at once in memory,
+    /// and `has_unsaved_changes` compares against this snapshot through
+    /// `Settings::persistable_eq` to light the Save control.
+    last_saved: Settings,
     pub state: AppState,
     pub hub: Hub,
     rx: Receiver<AppEvent>,
@@ -34,6 +41,10 @@ pub struct App {
     pub ports: Vec<(String, String)>,
 
     pub show_options: bool,
+    /// What Options opened with, so its Cancel can put it back.
+    pub options_snapshot: Option<super::options_dialog::OptionsSnapshot>,
+    /// The appearance switcher was clicked; applied once the frame is drawn.
+    colorway_pending: bool,
     pub show_about: bool,
     pub reveal_password: bool,
     pub mount_popup_open: bool,
@@ -43,6 +54,11 @@ pub struct App {
     pub connlog_view: super::connlog_window::ViewState,
     pub gga_view: super::gga_section::ViewState,
     pub profiles_view: super::profiles_dialog::ViewState,
+    /// The open "name this new profile" prompt, if any (New..., Duplicate...,
+    /// Save as profile...).
+    pub name_prompt: Option<super::profiles_dialog::NamePrompt>,
+    /// The open profile Export or Import dialog, if any.
+    pub transfer: Option<super::profile_transfer::Transfer>,
     /// Generation of the last unclassified caster response the user has SEEN
     /// by opening the Connection tab. While `state.ntrip.unknown_response_gen`
     /// runs ahead of it the Conn tab wears an attention dot; `bottom_tabs`
@@ -51,6 +67,10 @@ pub struct App {
     /// "something unusual arrived" signal moved from a window that popped to a
     /// badge on an always-present strip.)
     pub conn_unknown_ack: u64,
+    /// Keyboard focus as it stood when this frame began, before any widget
+    /// ran. The Profiles window reads it to tell "nothing is focused" from
+    /// "a main-window field gave up focus on this frame's Enter/Esc".
+    pub focus_at_frame_start: Option<egui::Id>,
     /// Embedded offline geocoder; None only if the compiled-in database
     /// fails validation (logged at boot).
     pub geodb: Option<geodb::GeoDb>,
@@ -75,8 +95,8 @@ pub struct App {
     /// Anchor for the envelope decay.
     activity_at: Instant,
     /// The corrections-need-a-receiver explainer has been logged for the
-    /// current NTRIP session; reset per connect so each session gets it at
-    /// most once instead of once per Streaming transition.
+    /// current NTRIP session (it fires on the first decoded RTCM3 frame);
+    /// reset per connect so each session gets it at most once.
     receiver_hint_logged: bool,
 }
 
@@ -89,7 +109,7 @@ impl App {
     ) -> Self {
         // Butter Paper visuals before the first frame: every window and
         // dialog derives its colors from the theme tokens, never ad hoc.
-        super::theme::apply(&cc.egui_ctx);
+        super::theme::apply(&cc.egui_ctx, settings.window.colorway);
         let (tx, rx) = std::sync::mpsc::channel::<AppEvent>();
         let logger = Logger::start(
             paths::logs_dir(&base),
@@ -102,6 +122,7 @@ impl App {
 
         let mut app = App {
             base,
+            last_saved: settings.clone(),
             settings,
             state: AppState::new(Instant::now()),
             hub,
@@ -113,6 +134,8 @@ impl App {
             last_gga: Arc::new(RwLock::new(None)),
             ports: serial::list_ports(),
             show_options: false,
+            options_snapshot: None,
+            colorway_pending: false,
             show_about: false,
             reveal_password: false,
             mount_popup_open: false,
@@ -121,7 +144,10 @@ impl App {
             connlog_view: Default::default(),
             gga_view: Default::default(),
             profiles_view: Default::default(),
+            name_prompt: None,
+            transfer: None,
             conn_unknown_ack: 0,
+            focus_at_frame_start: None,
             geodb: None,
             insecure_tls_active: false,
             rate_sample: (Instant::now(), 0),
@@ -285,8 +311,81 @@ impl App {
 
     pub fn save_settings(&mut self) {
         match settings::save(&self.settings, &paths::settings_file(&self.base)) {
-            Ok(()) => self.hub.event("Settings saved"),
+            Ok(()) => {
+                self.last_saved = self.settings.clone();
+                self.hub.event("Settings saved");
+            }
+            // The snapshot stays behind, so Save stays lit: a failed write
+            // is visible on the control, not only in the log.
             Err(e) => self.hub.event(format!("Could not save settings: {e}")),
+        }
+    }
+
+    /// Save As for the main window's settings: they become a new, active
+    /// profile named `name` and the profile they came from returns to its
+    /// last-saved state (see `profiles::save_as`); then everything is
+    /// written, as any Save As writes. Allowed while connected - the new
+    /// profile IS the live session's configuration, so per-caster UI state
+    /// (the loaded sourcetable) stays.
+    pub fn save_current_as(&mut self, name: &str) -> Result<(), crate::profiles::NameProblem> {
+        crate::profiles::save_as(&mut self.settings, &self.last_saved, name)?;
+        self.hub
+            .event(format!("Current settings saved as profile \"{name}\""));
+        self.save_settings();
+        Ok(())
+    }
+
+    /// Open the Import dialog on `path` (a double-clicked or dropped file).
+    pub fn import_file(&mut self, path: PathBuf) {
+        self.transfer = Some(super::profile_transfer::Transfer::import(self, Some(path)));
+    }
+
+    /// How profile `name` stands against settings.toml.
+    pub fn profile_save_state(&self, name: &str) -> super::profiles_dialog::ProfileSaveState {
+        use super::profiles_dialog::ProfileSaveState;
+        let current = self.settings.profiles.iter().find(|p| p.name == name);
+        match self.last_saved.profiles.iter().find(|p| p.name == name) {
+            None => ProfileSaveState::NotSaved,
+            Some(saved) if Some(saved) == current => ProfileSaveState::Saved,
+            Some(_) => ProfileSaveState::Edited,
+        }
+    }
+
+    /// True while a user edit has not been written to settings.toml yet.
+    /// UI geometry and app bookkeeping never count (see `persistable_eq`).
+    pub fn has_unsaved_changes(&self) -> bool {
+        !self.settings.persistable_eq(&self.last_saved)
+    }
+
+    /// The one Save control, shared by the profile strip and the Profiles
+    /// window so both say the same thing about the same state: solid
+    /// "Save changes" while something is unwritten, a disabled "Saved"
+    /// otherwise. Fixed width, so the strip does not shift when it flips.
+    pub fn save_control(&mut self, ui: &mut egui::Ui) {
+        let size = egui::vec2(SAVE_WIDTH, 0.0);
+        if self.has_unsaved_changes() {
+            // Accent outline and ink, not a solid fill: the surface's one
+            // solid primary is Connect, and Save must not compete with it.
+            let save = egui::Button::new(
+                egui::RichText::new("Save changes")
+                    .strong()
+                    .color(super::theme::accent()),
+            )
+            .stroke(egui::Stroke::new(1.5, super::theme::accent()))
+            .min_size(size);
+            if ui
+                .add(save)
+                .on_hover_text(
+                    "Write every change - profiles, fields, options - to settings.toml now. \
+                     Closing the app also saves.",
+                )
+                .clicked()
+            {
+                self.save_settings();
+            }
+        } else {
+            ui.add_enabled(false, egui::Button::new("Saved").min_size(size))
+                .on_disabled_hover_text("Everything is written to settings.toml");
         }
     }
 
@@ -297,6 +396,13 @@ impl App {
         self.reveal_password = false;
         self.mount_popup_open = false;
         self.state.ntrip.sourcetable = None;
+        // The last session's numbers, verdict and hints belong to the
+        // previous caster: shown under this one's name they would read as
+        // its data. (Switching is refused while a worker is live.)
+        if self.ntrip.is_none() {
+            self.state.ntrip.reset_stream_stats();
+            self.state.ntrip.status = NtripStatus::Idle;
+        }
     }
 
     /// Open the releases page and record today as the last check. Only the
@@ -346,21 +452,14 @@ impl App {
                     self.insecure_tls_active = false;
                 }
                 // Corrections without a receiver leave the age/DOP readouts
-                // empty; say why once per session, at the moment of success
-                // when the user is watching the log.
-                AppEvent::Ntrip(NtripStatus::Streaming) => {
+                // empty; say why once per session. Keyed on the first decoded
+                // frame, not on Streaming: bytes from a non-RTCM3 port are
+                // not corrections, and the explainer would misdiagnose them.
+                AppEvent::Rtcm(batch) if !batch.frames.is_empty() => {
                     if self.serial.is_none() && !self.receiver_hint_logged {
                         self.receiver_hint_logged = true;
-                        // Two short lines: a single long sentence clips at
-                        // the default window width, losing exactly the
-                        // remedy half this explainer exists to deliver.
                         self.hub.event(
-                            "Corrections are flowing; age, DOPs, elevation and \
-                             speed come from the receiver",
-                        );
-                        self.hub.event(
-                            "Connect a GPS receiver on the Serial side to \
-                             populate those readouts",
+                            "Age, DOPs, elevation and speed need a GNSS receiver (2 Receiver).",
                         );
                     }
                 }
@@ -369,6 +468,15 @@ impl App {
                     // mountpoint, so only the UI still knows which mount the
                     // profile actually targets.
                     self.log_mount_nmea_flag(host, *port, table);
+                    // Show the table the user asked for; one that a mount
+                    // request fell back to must not yank them off their tab.
+                    if self
+                        .ntrip
+                        .as_ref()
+                        .is_some_and(NtripHandle::is_table_request)
+                    {
+                        self.settings.window.tab = crate::settings::BottomTab::Sourcetable;
+                    }
                 }
                 _ => {}
             }
@@ -612,6 +720,7 @@ fn parse_iso_date(s: &str) -> Option<(i32, u8, u8)> {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.focus_at_frame_start = ctx.memory(|m| m.focused());
         self.drain_events();
         self.update_rate_meter();
         self.track_geometry(&ctx);
@@ -626,7 +735,7 @@ impl eframe::App for App {
         }
 
         // Topbar rides one paper step above the base, per the guide.
-        let topbar = egui::Frame::side_top_panel(&ctx.global_style()).fill(super::theme::PAPER_2);
+        let topbar = egui::Frame::side_top_panel(&ctx.global_style()).fill(super::theme::paper_2());
         egui::Panel::top(egui::Id::new("top-strip"))
             .frame(topbar)
             .show(ui, |ui| {
@@ -650,7 +759,7 @@ impl eframe::App for App {
 the caster's identity is not being checked",
                         )
                         .strong()
-                        .color(super::theme::DANGER),
+                        .color(super::theme::danger()),
                     );
                 });
         }
@@ -660,18 +769,22 @@ the caster's identity is not being checked",
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // Two config columns; the NTRIP column carries the GGA disclosure.
+            // Set up, verdict, evidence - top to bottom. Step 1 (the caster,
+            // with the GGA disclosure) reads first; step 2 (the optional
+            // receiver) beside it.
             ui.columns(2, |cols| {
-                super::serial_block::show(self, &mut cols[0]);
-                super::ntrip_block::show(self, &mut cols[1]);
+                super::ntrip_block::show(self, &mut cols[0]);
+                super::serial_block::show(self, &mut cols[1]);
             });
+            ui.add_space(6.0);
+            // The verdict: one band answers "is it working?", directly under
+            // the Connect that was just pressed.
+            super::session_band::show(self, ui);
             ui.add_space(4.0);
+            // Evidence: the receiver's readouts, then the four diagnostic
+            // tabs filling the remaining height.
             super::status_strip::show(self, ui);
             ui.add_space(4.0);
-            // One Surface: a one-line stream summary (renders only when live)
-            // sits above the always-present bottom tab pane, which fills the
-            // remaining height with the four diagnostic surfaces.
-            super::stream_summary::show(self, ui);
             super::bottom_tabs::show(self, ui);
         });
 
@@ -680,6 +793,12 @@ the caster's identity is not being checked",
         super::options_dialog::show(self, &ctx);
         super::about::show(self, &ctx);
         super::profiles_dialog::show(self, &ctx);
+        super::profiles_dialog::show_name_prompt(self, &ctx);
+        super::profile_transfer::handle_drops(self, &ctx);
+        super::profile_transfer::show(self, &ctx);
+        if std::mem::take(&mut self.colorway_pending) {
+            super::theme::set_colorway(&ctx, self.settings.window.colorway);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -699,46 +818,62 @@ the caster's identity is not being checked",
     }
 }
 
+/// Width of the Save control in both of its states.
+const SAVE_WIDTH: f32 = 104.0;
+
 impl App {
     fn profile_strip(&mut self, ui: &mut egui::Ui) {
         ui.label("Profile:");
-        let names: Vec<String> = self
-            .settings
-            .profiles
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
         let mut selected = self.settings.active_profile.clone();
         // Same connected-state lock the Profiles Manager enforces: a live
         // NTRIP worker was built from the ACTIVE profile, so switching it
         // mid-session would relabel the running stream with another
         // profile's host/mount and reset per-caster UI state under it.
         let busy = self.ntrip_busy();
+        let profiles = &self.settings.profiles;
         ui.add_enabled_ui(!busy, |ui| {
             egui::ComboBox::from_id_salt("profile-combo")
                 .width(170.0)
                 .selected_text(selected.clone())
+                // Only runs while the list is open, so idle frames format
+                // nothing.
                 .show_ui(ui, |ui| {
-                    for name in &names {
-                        ui.selectable_value(&mut selected, name.clone(), name);
+                    for p in profiles {
+                        ui.selectable_value(&mut selected, p.name.clone(), &p.name)
+                            .on_hover_text(p.summary());
                     }
                 });
-        })
-        .response
-        .on_disabled_hover_text("Disconnect before switching profiles");
+        });
         if !busy && selected != self.settings.active_profile {
             self.settings.active_profile = selected;
             self.on_profile_switched();
+            self.hub.event(format!(
+                "Profile \"{}\" activated",
+                self.settings.active_profile
+            ));
         }
-        if ui.button("Save").clicked() {
-            self.save_settings();
+        self.save_control(ui);
+        if ui
+            .button("Save as profile...")
+            .on_hover_text(
+                "Keep the settings below as a new profile with a name you choose - \
+                 set them up, Connect to check they work, then save them here.",
+            )
+            .clicked()
+        {
+            self.name_prompt = Some(super::profiles_dialog::NamePrompt::save_as(self));
         }
         if ui
-            .button("Manage...")
-            .on_hover_text("Add, clone, rename, and delete profiles")
+            .button("Manage profiles...")
+            .on_hover_text("Add, duplicate, rename, reorder, delete, import and export profiles")
             .clicked()
         {
             self.show_profiles = true;
+        }
+        // Said where the user is looking, not only in a tooltip: the picker
+        // is locked for the whole session, so the reason stays on screen.
+        if busy {
+            ui.label(super::theme::caption("Disconnect to switch profiles"));
         }
 
         // The protocol exchange and RTCM statistics are always-present bottom
@@ -749,6 +884,10 @@ impl App {
             }
             if ui.button("Options").clicked() {
                 self.show_options = true;
+            }
+            if let Some(c) = super::theme::colorway_switch(ui) {
+                self.settings.window.colorway = c;
+                self.colorway_pending = true;
             }
         });
     }

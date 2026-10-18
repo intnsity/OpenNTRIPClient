@@ -1,10 +1,22 @@
-# Butter Paper - the Open NTRIP Client design system
+# ButterPaper - the Open NTRIP Client design system
 
-The GUI uses a warm light theme called Butter Paper. The single source of truth for
-values is `crates/app/src/ui/theme.rs` (token constants + `visuals()`); source-scan
-tests enforce that no window references a raw color outside that module. This
-document records the rules those tokens implement so contributors can change the
-theme without breaking its logic.
+The GUI uses the [ButterPaper](https://github.com/intnsity/ButterPaper) v2 token set in
+three colorways, switched from the appearance icon on the profile bar (the same sheet /
+moon-over-mesa / moon-over-pines icons as docs.igage.com and forum.igage.com):
+
+| Colorway | id | Character |
+|---|---|---|
+| Butter Paper (default) | `paper` | warm cream paper, brown ink, cobalt interaction |
+| Southwest Night | `desert` | desert dusk browns, bloom-orange interaction, caution-yellow warnings |
+| Nordic Night | `nordic` | cabin greys, ember-orange interaction; no navy, teal or cobalt surfaces |
+
+The single source of truth for values is `crates/app/src/ui/theme.rs`: one `Palette` per
+colorway plus `visuals_for(palette)`. Render code reads tokens only through the accessor
+functions (`theme::ink_secondary()`, `theme::accent()`, ...), which answer for the active
+colorway; source-scan tests enforce that no window names a raw color outside that module, and
+every contrast rule below is tested against all three palettes. This document records the
+rules; the tables give the Butter Paper values (the night values are ButterPaper v2's
+`desert` / `nordic` tokens, verbatim).
 
 ## Paper stack (depth by tint, never by shadow)
 
@@ -24,21 +36,42 @@ Depth comes from stepping through these tints; drop shadows are not used.
 |---|---|---|
 | ink-primary | `#2B2417` | body text, values, headings |
 | ink-secondary | `#6B6250` | labels, hints, placeholders, weak text |
-| ink-muted | `#8F8570` | disabled text and hairline-adjacent chrome only |
+| ink-muted | `#897F6B` | control outlines and disabled text only (ButterPaper `control-border`) |
 
-Note: the original guide proposed `#9C927C` for muted ink; it measures below the
-3:1 non-text floor on this paper, so the shipped token is darkened to `#8F8570`.
-Muted ink is test-enforced to stay out of readable content.
+Muted ink must clear the 3:1 non-text floor on every surface it borders, in every colorway,
+and is test-enforced to stay out of readable content.
 
 ## Accent and semantics
 
 - Interactive (buttons, links, focus, active tab, plot line): cobalt `#1E40AF`,
   hover `#1B3691`. Cobalt always means "you can click this".
 - Success / RTK Fixed: emerald `#047857`.
-- Warning / RTK Float: signal orange `#C2410C`. Warning is NEVER yellow - yellow
-  vanishes on this paper.
+- Warning / RTK Float: signal orange `#C2410C`. On paper, warning is NEVER yellow - yellow
+  vanishes on cream. (The night colorways use caution yellow `#FFD447`, which is their correct
+  warning.)
 - Danger / Invalid fix / TLS-insecure banner: crimson `#BE123C` on a danger tint.
 - Borders: warm hairline `rgba(43,36,23,0.14)`.
+
+## Controls: buttons are not fields
+
+White means "you can type here", so a clickable control must never be a white plate.
+
+| Control | Look | Source |
+|---|---|---|
+| Text field, number field | white, muted-ink border | `text_edit_bg_color`; DragValues via `theme::number_field` |
+| Secondary button, picker (combo) | cool accent-tint face `#E4EBFA`, muted-ink border, ink text | `widgets.inactive.weak_bg_fill` |
+| Primary button (one per surface: Connect on the main window, the action in a dialog) | solid accent, `on_accent` text | `theme::accent_button` |
+| Pending save (Save changes) | accent outline and accent ink on the button face - visible, never competing with Connect | `App::save_control` |
+| Destructive confirm | solid danger fill, only inside a confirmation | `theme::danger_button` |
+| Selected list row | paper tint, cobalt outline and left bar | `theme::list_row_background` |
+
+The tint shifts hue rather than lightness, so it separates from every warm paper and from white
+at a glance. egui builds DragValue from a Button, so number fields must go through
+`theme::number_field` to keep the editable plate (source-scan test `number_fields_stay_editable`).
+On the night colorways the editable plate is the raised surface, not white; the rule is the
+same - the plate means "you can type here" and nothing clickable wears it.
+Warning callouts (`theme::warning_callout`) use primary ink on the warning tint with an orange
+rule: orange text on that tint is only ~4.4:1.
 
 ## Typography
 

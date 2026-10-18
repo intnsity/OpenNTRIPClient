@@ -3,9 +3,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use open_ntrip_client::{install_panic_hook, paths, settings, ui};
+use open_ntrip_client::{install_panic_hook, paths, profile_file, settings, ui};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -17,6 +18,14 @@ fn main() -> ExitCode {
     install_panic_hook();
     let base = paths::exe_dir();
     let (settings, boot_log) = settings::load_or_import(&base);
+    // A double-clicked (or "Open with") profile file arrives as the only
+    // argument; the app opens on its Import dialog.
+    let import = match args.as_slice() {
+        [one] if profile_file::has_extension(Path::new(one), profile_file::EXTENSION) => {
+            Some(PathBuf::from(one))
+        }
+        _ => None,
+    };
 
     // Window geometry restores from settings.toml; eframe's own persistence
     // stays off because it writes to AppData and this app is portable.
@@ -42,7 +51,13 @@ fn main() -> ExitCode {
     let result = eframe::run_native(
         "Open NTRIP Client",
         options,
-        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, base, settings, boot_log)))),
+        Box::new(move |cc| {
+            let mut app = ui::App::new(cc, base, settings, boot_log);
+            if let Some(path) = import {
+                app.import_file(path);
+            }
+            Ok(Box::new(app))
+        }),
     );
     match result {
         Ok(()) => ExitCode::SUCCESS,

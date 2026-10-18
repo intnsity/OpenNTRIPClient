@@ -2,6 +2,8 @@
 //! test suite: the filter boxes in different windows must never drift apart
 //! in matching semantics.
 
+use std::time::Duration;
+
 /// ASCII-case-insensitive substring test, allocation-free. Bytewise windows
 /// are exact for any UTF-8 needle; only ASCII letters fold case, which is
 /// the right trade for protocol text (headers, mountpoints, sourcetable
@@ -18,9 +20,31 @@ pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
+/// "just now", "5 min ago", "3 h ago", "2 days ago": a file's age needs no
+/// timezone, and recency is what picks the right file from a list.
+pub fn age_label(age: Duration) -> String {
+    let s = age.as_secs();
+    match s {
+        0..60 => "just now".to_string(),
+        60..3_600 => format!("{} min ago", s / 60),
+        3_600..86_400 => format!("{} h ago", s / 3_600),
+        86_400..172_800 => "1 day ago".to_string(),
+        _ => format!("{} days ago", s / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ages_read_like_a_person_would_say_them() {
+        assert_eq!(age_label(Duration::from_secs(5)), "just now");
+        assert_eq!(age_label(Duration::from_secs(300)), "5 min ago");
+        assert_eq!(age_label(Duration::from_secs(7_200)), "2 h ago");
+        assert_eq!(age_label(Duration::from_secs(90_000)), "1 day ago");
+        assert_eq!(age_label(Duration::from_secs(3 * 86_400)), "3 days ago");
+    }
 
     #[test]
     fn is_ascii_case_insensitive() {

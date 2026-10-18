@@ -6,6 +6,7 @@
 //!
 //! - [`settings`]: frozen-schema TOML model + legacy Settings.txt import
 //! - [`profiles`]: profile CRUD invariants behind the Profiles Manager
+//! - [`profile_file`]: `.oncprofile` export/import and the import plan
 //! - [`bus`]: worker -> UI events, the logger fan-out, repaint throttling
 //! - [`state`]: UI-thread state, mutated only by draining the bus
 //! - [`workers`]: ntrip connection worker (+ reconnect supervisor), serial
@@ -18,6 +19,7 @@ pub mod audio;
 pub mod bus;
 pub mod logging;
 pub mod paths;
+pub mod profile_file;
 pub mod profiles;
 pub mod selftest;
 pub mod settings;

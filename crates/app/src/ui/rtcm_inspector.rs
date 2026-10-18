@@ -17,27 +17,47 @@ use crate::ui::{App, theme};
 
 pub fn tab(app: &mut App, ui: &mut egui::Ui) {
     let now = Instant::now();
-    type_table(app, ui, now);
-    ui.add_space(6.0);
-    totals_strip(app, ui);
-    ui.separator();
-    decoded_panel(app, ui);
+    // One scroll for the whole page: with the table scrolling on its own,
+    // a short window clipped the decoded base block below it - the 1005/
+    // 1006 position a surveyor opens this tab for.
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            type_table(app, ui, now);
+            ui.add_space(6.0);
+            totals_strip(app, ui);
+            ui.separator();
+            decoded_panel(app, ui);
+        });
 }
 
 // ----------------------------------------------------------------------
 // Per-type statistics table
 // ----------------------------------------------------------------------
 
+/// The table's empty state. Bytes with no frame among them is its own
+/// diagnosis: the stream is alive but not RTCM3 (a Trimble RT27/CMR or
+/// other binary port looks exactly like this).
+fn empty_text(connected: bool, garbage_bytes: u64) -> &'static str {
+    if garbage_bytes > 0 {
+        "Bytes are arriving but none are RTCM3 frames - this stream may be another format (e.g. Trimble RT27 or CMR)."
+    } else if connected {
+        "No RTCM frames yet."
+    } else {
+        "No RTCM frames yet. Connect to see this stream's messages, base station and antenna."
+    }
+}
+
 fn type_table(app: &App, ui: &mut egui::Ui, now: Instant) {
     if app.state.ntrip.rtcm.is_empty() {
-        ui.label(egui::RichText::new("No RTCM frames received yet").weak());
+        let text = empty_text(app.ntrip_busy(), app.state.ntrip.rtcm_garbage_bytes);
+        ui.label(egui::RichText::new(text).weak());
         return;
     }
     TableBuilder::new(ui)
         .id_salt("rtcm-type-table")
         .striped(true)
-        .vscroll(true)
-        .max_scroll_height(280.0)
+        .vscroll(false)
         .column(Column::exact(40.0))
         .column(Column::remainder().at_least(170.0).clip(true))
         .column(Column::exact(64.0))
@@ -155,7 +175,7 @@ fn base_rows(app: &App, ui: &mut egui::Ui) {
 
     // Only 1006 carries DF028; 1005 must not render a phantom zero height.
     if let Some(h) = antenna_height_m {
-        ui.label("Antenna height");
+        ui.label("ARP height (1006)");
         ui.label(format!("{h:.4} m"));
         ui.end_row();
     }
@@ -299,11 +319,15 @@ fn fmt_baseline(d_m: f64) -> String {
 
 /// Base geodetic position line. `None` is decode.rs's normalization of the
 /// all-zero-ECEF pattern an un-surveyed base broadcasts; say so instead of
-/// inventing a point.
+/// inventing a point. One resolution for all three numbers - the
+/// millimetre: height to 0.001 m, and lat/lon to 1e-8 deg (~1.1 mm of
+/// latitude, never more of longitude). The 1005/1006 ECEF fields carry
+/// 0.1 mm, so every printed digit is real; at 1e-7 deg the horizontal
+/// would have been ten times coarser than the height beside it.
 fn position_text(lla: Option<(f64, f64, f64)>) -> String {
     match lla {
         None => "position not set (all-zero ECEF)".to_string(),
-        Some((lat, lon, alt)) => format!("{lat:.7}, {lon:.7}  alt {alt:.1} m"),
+        Some((lat, lon, alt)) => format!("{lat:.8}, {lon:.8}  h {alt:.3} m (ellipsoidal)"),
     }
 }
 
@@ -480,11 +504,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_state_tells_dead_from_not_rtcm() {
+        assert!(empty_text(false, 0).contains("Connect"));
+        assert!(!empty_text(true, 0).contains("Connect"));
+        assert!(empty_text(true, 512).contains("none are RTCM3"));
+    }
+
+    #[test]
     fn position_text_all_zero_ecef_reads_as_not_set() {
         assert_eq!(position_text(None), "position not set (all-zero ECEF)");
         assert_eq!(
             position_text(Some((38.8047594, -77.0647736, 114.56))),
-            "38.8047594, -77.0647736  alt 114.6 m"
+            "38.80475940, -77.06477360  h 114.560 m (ellipsoidal)"
+        );
+        // The requirement's own example: three decimals, not rounded to 0.1.
+        assert_eq!(
+            position_text(Some((35.0, -106.0, 1615.876))),
+            "35.00000000, -106.00000000  h 1615.876 m (ellipsoidal)"
         );
     }
 
