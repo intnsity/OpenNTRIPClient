@@ -3735,7 +3735,7 @@ Applies to:
 - ring 0.17.14 - https://github.com/briansmith/ring
 - rustix 0.38.44 - https://github.com/bytecodealliance/rustix
 - rustix 1.1.4 - https://github.com/bytecodealliance/rustix
-- rustls 0.23.42 - https://github.com/rustls/rustls
+- rustls 0.23.46 - https://github.com/rustls/rustls
 - scoped-tls 1.0.1 - https://github.com/alexcrichton/scoped-tls
 - scopeguard 1.2.0 - https://github.com/bluss/scopeguard
 - signal-hook-registry 1.4.8 - https://github.com/vorner/signal-hook
@@ -4178,7 +4178,7 @@ limitations under the License.
 
 Applies to:
 
-- webbrowser 1.2.1 - https://github.com/amodm/webbrowser-rs
+- webbrowser 1.2.4 - https://github.com/amodm/webbrowser-rs
 
 ```
                               Apache License
@@ -6556,7 +6556,7 @@ THIS SOFTWARE.
 
 Applies to:
 
-- rustls-webpki 0.103.13 - https://github.com/rustls/webpki
+- rustls-webpki 0.103.15 - https://github.com/rustls/webpki
 
 ```
 Except as otherwise noted, this project is licensed under the following

@@ -69,6 +69,11 @@ small files.
   latitude/longitude go to 8 decimals (~1.1 mm) to match the height beside them
 - The GGA header no longer warns about a missing position on Raw TCP, where none is sent
 
+### Security
+
+- rustls 0.23.46 (RUSTSEC-2026-0285, -0346, -0348, -0349) and webbrowser 1.2.4
+  (RUSTSEC-2026-0257).
+
 ## [0.2.1] - 2026-07-23
 
 Field fix: CHC APIS casters connected but never streamed ("Connected - waiting for data",

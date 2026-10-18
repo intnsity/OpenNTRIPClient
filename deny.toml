@@ -53,9 +53,18 @@ yanked = "deny"
 # untrusted runtime input - and it is absent from the Windows binary entirely.
 # It is pinned by the winit/eframe GUI stack and cannot advance without moving
 # that whole stack. Re-audit when the GUI stack is next bumped.
+#
+# zbus_names / zvariant / zvariant_derive "unmaintained" notices: not
+# vulnerabilities - the crates were folded into zbus 6. They enter ONLY via
+# eframe -> accesskit_unix (Linux AT-SPI screen-reader support) on zbus 5,
+# absent from the Windows and macOS binaries, and move when accesskit adopts
+# zbus 6. Re-audit on the next eframe bump.
 ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
 
 [bans]
