@@ -8,7 +8,7 @@ licenses. This file is generated from Cargo.lock by cargo-about:
 
 ## Overview
 
-- Apache License 2.0 (Apache-2.0): used 260 time(s)
+- Apache License 2.0 (Apache-2.0): used 258 time(s)
 - MIT License (MIT): used 78 time(s)
 - Unicode License v3 (Unicode-3.0): used 19 time(s)
 - GNU General Public License v3.0 or later (GPL-3.0-or-later): used 5 time(s)
@@ -4380,7 +4380,6 @@ Applies to:
 
 - getrandom 0.2.17 - https://github.com/rust-random/getrandom
 - getrandom 0.3.4 - https://github.com/rust-random/getrandom
-- getrandom 0.4.3 - https://github.com/rust-random/getrandom
 
 ```
                               Apache License
@@ -6014,7 +6013,6 @@ Applies to:
 - profiling 1.0.18 - https://github.com/aclysma/profiling
 - quote 1.0.46 - https://github.com/dtolnay/quote
 - r-efi 5.3.0 - https://github.com/r-efi/r-efi
-- r-efi 6.0.0 - https://github.com/r-efi/r-efi
 - raw-window-handle 0.6.2 - https://github.com/rust-windowing/raw-window-handle
 - rustversion 1.0.23 - https://github.com/dtolnay/rustversion
 - serde 1.0.228 - https://github.com/serde-rs/serde
